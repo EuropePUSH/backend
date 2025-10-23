@@ -1,11 +1,13 @@
 import express from "express";
 import cors from "cors";
+// Hvis din Node version < 18, så kør: npm i undici
+// import { fetch } from "undici";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/** In-memory job store (POC) */
+/** In-memory job store */
 const jobs = new Map();
 
 /** Tiny helpers */
@@ -13,32 +15,39 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const uniq = (arr) => [...new Set(arr || [])];
 const now = () => new Date().toISOString();
 
-/** Optional webhook pinger */
+/** Robust webhook notifier */
 async function notify(url, body) {
-  if (!url) return;
   try {
-    await fetch(url, {
+    if (!url || typeof url !== "string") return;
+    if (!/^https?:\/\//i.test(url)) return;
+    if (url.includes("base44-webhook-url")) return; // ignorer fake webhook
+
+    const res = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
+
+    if (!res.ok) {
+      console.log("⚠️ webhook non-200:", res.status);
+    }
   } catch (e) {
-    console.log("⚠️ webhook notify failed:", e.message);
+    console.log("⚠️ webhook notify failed (suppressed):", e.message);
   }
 }
 
-/** Health */
+/** Healthcheck */
 app.get("/", (_req, res) => res.json({ status: "API running" }));
 
-/** Create job – handles exactly the payload du logger fra Base44 */
+/** Create job */
 app.post("/jobs", async (req, res) => {
   const p = req.body || {};
 
-  // --- 1) Validation / normalisering (keep it lightweight) ---
   const source = String(p.source_video_url || "");
   if (!source.endsWith(".mp4")) {
     return res.status(400).json({ error: "source_video_url must be an MP4 url" });
   }
+
   const preset = String(p.preset_id || "default");
   const variations = clamp(parseInt(p.variations || 1, 10), 1, 50);
 
@@ -53,26 +62,25 @@ app.post("/jobs", async (req, res) => {
   const postingPolicy = p.posting_policy || null;
   const webhookStatusUrl = p.webhook_status_url || null;
 
-  // --- 2) Opret job-objekt ---
   const jobId = "job_" + Math.random().toString(36).slice(2, 10);
   const job = {
     job_id: jobId,
     created_at: now(),
-    state: "queued",        // queued -> processing -> complete/failed
-    progress: 0,            // 0..100
+    state: "queued",
+    progress: 0,
     input: { source, preset, variations, targetPlatforms, accounts, soundStrategy, postingPolicy },
-    outputs: [],            // fyldes når “processing” kører
+    outputs: [],
     events: [{ at: now(), state: "queued" }],
   };
 
   jobs.set(jobId, job);
   console.log("🚀 New Base44 job received:", JSON.stringify(p, null, 2));
 
-  // Respondér med det samme så UI kan vise status
   res.status(201).json({ job_id: jobId, state: job.state, progress: job.progress });
 
-  // --- 3) Simuler processing async (POC) ---
-  // step 1: processing starter
+  // ---- Simuleret workflow ----
+
+  // 1️⃣ queued -> processing
   setTimeout(async () => {
     const j = jobs.get(jobId);
     if (!j) return;
@@ -82,12 +90,12 @@ app.post("/jobs", async (req, res) => {
     await notify(webhookStatusUrl, { job_id: jobId, state: j.state, progress: j.progress });
   }, 800);
 
-  // step 2: generér outputs (fake links + captions/hashtags)
+  // 2️⃣ processing -> generate outputs
   setTimeout(async () => {
     const j = jobs.get(jobId);
     if (!j) return;
 
-    const baseOut = "https://files.example.com/" + jobId; // byt til rigtig storage senere
+    const baseOut = "https://files.example.com/" + jobId;
     const hooks = [
       "ICEBERG drop i dag ❄️",
       "Ny batch – er du klar?",
@@ -109,7 +117,6 @@ app.post("/jobs", async (req, res) => {
       const cta = ctas[i % ctas.length];
       return {
         id: i + 1,
-        // POC: peger på samme kilde; byt til rigtig render-url/færdige klip senere
         url: `${baseOut}/clip_v${i + 1}.mp4`,
         caption: `${hook} — ${cta}`,
         hashtags
@@ -121,7 +128,7 @@ app.post("/jobs", async (req, res) => {
     await notify(webhookStatusUrl, { job_id: jobId, state: j.state, progress: j.progress, outputs: out.map(o => o.url) });
   }, 2000);
 
-  // step 3: complete
+  // 3️⃣ processing -> complete
   setTimeout(async () => {
     const j = jobs.get(jobId);
     if (!j) return;
@@ -132,14 +139,14 @@ app.post("/jobs", async (req, res) => {
   }, 3500);
 });
 
-/** Job status */
+/** Get job status */
 app.get("/jobs/:job_id", (req, res) => {
   const job = jobs.get(req.params.job_id);
   if (!job) return res.status(404).json({ error: "job not found" });
   res.json(job);
 });
 
-/** Simple accounts endpoint (mock til UI) */
+/** Mock accounts endpoint */
 app.get("/accounts", (_req, res) => {
   res.json({
     tiktok: [{ id: "tk_main", handle: "@brandmain" }, { id: "tk_alt", handle: "@brandalt" }],
