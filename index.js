@@ -3,6 +3,17 @@ import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
 // import { fetch } from "undici"; // kun hvis din Node < 18
 
+// 🔐 Simple API key protection for POST /jobs
+app.use((req, res, next) => {
+  if (req.method === "POST" && req.path === "/jobs") {
+    const key = req.headers["x-api-key"];
+    if (!key || key !== process.env.API_KEY) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+  }
+  next();
+});
+
 const app = express();
 app.use(cors());
 app.use(express.json());
