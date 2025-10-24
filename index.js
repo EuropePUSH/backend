@@ -3,6 +3,10 @@ import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
 // import { fetch } from "undici"; // kun hvis din Node < 18
 
+const app = express();
+app.use(cors());
+app.use(express.json());
+
 // 🔐 Simple API key protection for POST /jobs
 app.use((req, res, next) => {
   if (req.method === "POST" && req.path === "/jobs") {
@@ -14,9 +18,6 @@ app.use((req, res, next) => {
   next();
 });
 
-const app = express();
-app.use(cors());
-app.use(express.json());
 
 // ======== ENV CHECK ========
 const { SUPABASE_URL, SUPABASE_SERVICE_KEY } = process.env;
