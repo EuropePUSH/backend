@@ -18,6 +18,20 @@ app.use((req, res, next) => {
   next();
 });
 
+// 🧪 Health check endpoint
+app.get("/health", async (_req, res) => {
+  try {
+    const { error } = await supabase
+      .from("jobs")
+      .select("count", { count: "exact", head: true });
+    if (error) throw error;
+    res.json({ up: true, db: true });
+  } catch {
+    res.status(500).json({ up: true, db: false });
+  }
+});
+
+
 // ======== ENV CHECK ========
 const { SUPABASE_URL, SUPABASE_SERVICE_KEY } = process.env;
 console.log("🔧 ENV SUPABASE_URL:", SUPABASE_URL ? "present" : "MISSING");
