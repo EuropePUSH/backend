@@ -7,17 +7,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔐 Simple API key protection for POST /jobs
+// 🔐 API-key middleware (beskytter POST /jobs)
 app.use((req, res, next) => {
   if (req.method === "POST" && req.path === "/jobs") {
-    const key = req.headers["x-api-key"];
+    const key = req.headers["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRkbGF5d2hqYW10c3NlYW15ZmNwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTMwNjY5NSwiZXhwIjoyMDc2ODgyNjk1fQ.4ixlfXFANXHWJL3KV6wtztjZPmlApDkuIls_HIkpax4"];
     if (!key || key !== process.env.API_KEY) {
       return res.status(401).json({ error: "unauthorized" });
     }
   }
   next();
 });
-
 
 // ======== ENV CHECK ========
 const { SUPABASE_URL, SUPABASE_SERVICE_KEY } = process.env;
