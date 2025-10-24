@@ -7,11 +7,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔐 API-key middleware (beskytter POST /jobs)
+// 🔐 API-key middleware (trim + supports Authorization: Bearer ...)
+const EXPECTED_KEY = (process.env.API_KEY || "").trim();
+
 app.use((req, res, next) => {
-  if (req.method === "POST" && req.path === "/jobs") {
-    const key = req.headers["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRkbGF5d2hqYW10c3NlYW15ZmNwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MTMwNjY5NSwiZXhwIjoyMDc2ODgyNjk1fQ.4ixlfXFANXHWJL3KV6wtztjZPmlApDkuIls_HIkpax4"];
-    if (!key || key !== process.env.API_KEY) {
+  if (req.method === "POST" && (req.path === "/jobs" || req.path === "/jobs/")) {
+    const headerKey = (
+      (req.headers["x-api-key"] ?? req.headers["X-Api-Key"] ?? "")
+    ).toString().trim();
+
+    const bearer = (req.headers.authorization || "").toString().trim();
+    const bearerKey = bearer.startsWith("Bearer ") ? bearer.slice(7).trim() : "";
+
+    const provided = headerKey || bearerKey;
+
+    if (!EXPECTED_KEY || !provided || provided !== EXPECTED_KEY) {
       return res.status(401).json({ error: "unauthorized" });
     }
   }
