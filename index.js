@@ -11,6 +11,26 @@ app.use(express.json());
 // + trimmer whitespace og accepterer /jobs og /jobs/
 const EXPECTED_KEY = (process.env.API_KEY || "").trim();
 
+// Acceptér også GET /jobs?id=<job_id> (ud over /jobs/:job_id)
+app.get("/jobs", async (req, res) => {
+  const id = req.query.id || req.query.job_id;
+  if (!id) return res.status(400).json({ error: "missing job_id" });
+  try {
+    const job = await dbGetJob(id);
+    if (!job) return res.status(404).json({ error: "job not found" });
+    res.json(job);
+  } catch (e) {
+    console.error("GET /jobs (query) error:", e);
+    res.status(500).json({ error: "internal_error" });
+  }
+});
+
+// Venlig 404-logger så vi kan se hvad Base44 kalder
+app.use((req, _res, next) => {
+  console.log("404 hit:", req.method, req.path);
+  next();
+});
+
 app.use((req, res, next) => {
   if (req.method === "POST" && (req.path === "/jobs" || req.path === "/jobs/")) {
     const headerKey = (req.headers["x-api-key"] ?? req.headers["X-Api-Key"] ?? "").toString().trim();
