@@ -1,6 +1,6 @@
 // index.js — EuropePush backend (Render + Supabase Storage)
-// Requires: express, cors, @supabase/supabase-js
-// Env vars (Render): SUPABASE_URL, SUPABASE_SERVICE_KEY, API_KEY
+// Env: SUPABASE_URL, SUPABASE_SERVICE_KEY, API_KEY
+// Storage: Supabase public bucket "outputs"
 
 import express from "express";
 import cors from "cors";
@@ -8,26 +8,27 @@ import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "50mb" })); // større payloads for base64
 
-// ---------- ENV + SUPABASE ----------
+// ---------- ENV ----------
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
 const SUPABASE_SERVICE_KEY = (process.env.SUPABASE_SERVICE_KEY || "").trim();
 const API_KEY = (process.env.API_KEY || "").trim();
 
-console.log("🔧 ENV SUPABASE_URL:", SUPABASE_URL ? "present" : "MISSING");
-console.log("🔧 ENV SUPABASE_SERVICE_KEY:", SUPABASE_SERVICE_KEY ? "present" : "MISSING");
-console.log("🔧 ENV API_KEY:", API_KEY ? "present" : "MISSING");
+console.log("🔧 ENV SUPABASE_URL:", !!SUPABASE_URL ? "present" : "MISSING");
+console.log("🔧 ENV SUPABASE_SERVICE_KEY:", !!SUPABASE_SERVICE_KEY ? "present" : "MISSING");
+console.log("🔧 ENV API_KEY:", !!API_KEY ? "present" : "MISSING");
 
 const supabase = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
   : null;
 
+// ---------- UTILS ----------
 const nowISO = () => new Date().toISOString();
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const uniq = (arr) => [...new Set(arr || [])];
 
-// ---------- SIMPLE AUTH (x-api-key) ----------
+// ---------- AUTH (x-api-key på POST /jobs) ----------
 app.use((req, res, next) => {
   if (req.method === "POST" && (req.path === "/jobs" || req.path === "/jobs/")) {
     const headerKey = (req.headers["x-api-key"] ?? "").toString().trim();
@@ -120,19 +121,36 @@ async function fetchMp4ToBuffer(url) {
   return Buffer.from(ab);
 }
 
+function parseBase64Video(input) {
+  if (!input || typeof input !== "string") return null;
+  let base64 = input.trim();
+  // data:video/mp4;base64,XXXX...
+  const commaIdx = base64.indexOf(",");
+  if (base64.startsWith("data:")) {
+    if (commaIdx === -1) return null;
+    base64 = base64.slice(commaIdx + 1);
+  }
+  if (!/^[A-Za-z0-9+/=\s]+$/.test(base64)) return null;
+  try {
+    const buf = Buffer.from(base64, "base64");
+    if (buf.length < 10 * 1024) return null; // mindst ~10KB
+    return buf;
+  } catch {
+    return null;
+  }
+}
+
 async function uploadToStoragePublic(jobId, buf) {
-  // Bucket = "outputs" (public). Sti: jobs/<job_id>/clip_v1.mp4
   const path = `jobs/${jobId}/clip_v1.mp4`;
   const { error: upErr } = await supabase
     .storage.from("outputs")
     .upload(path, buf, { contentType: "video/mp4", upsert: true });
   if (upErr) throw upErr;
-
   const { data } = supabase.storage.from("outputs").getPublicUrl(path);
-  return data.publicUrl; // direkte offentlig URL
+  return data.publicUrl; // public bucket → direkte URL
 }
 
-// ---------- MISC ----------
+// ---------- UTIL ----------
 async function notify(url, body) {
   try {
     if (!url || typeof url !== "string") return;
@@ -165,13 +183,22 @@ app.get("/health", async (_req, res) => {
 app.post("/jobs", async (req, res) => {
   try {
     const p = req.body || {};
-    const source = String(p.source_video_url || "");
-    if (!source || !source.toLowerCase().endsWith(".mp4")) {
-      return res.status(400).json({ error: "source_video_url must be a .mp4 url" });
+
+    // Kilde: enten URL (.mp4) eller base64
+    const sourceUrl = typeof p.source_video_url === "string" ? p.source_video_url.trim() : "";
+    const sourceB64 = typeof p.source_video_base64 === "string" ? p.source_video_base64 : "";
+
+    let sourceType = null; // "url" | "base64"
+    if (sourceUrl && sourceUrl.toLowerCase().endsWith(".mp4")) {
+      sourceType = "url";
+    } else if (sourceB64) {
+      sourceType = "base64";
+    } else {
+      return res.status(400).json({ error: "Provide source_video_url (.mp4) OR source_video_base64 (data URL or raw base64)" });
     }
 
     const preset = String(p.preset_id || "default");
-    const variations = clamp(parseInt(p.variations || 1, 10), 1, 50); // vi uploader 1:1 i V1
+    const variations = clamp(parseInt(p.variations || 1, 10), 1, 50);
     const targetPlatforms = uniq(p.target_platforms || []);
     const accounts = {
       tiktok: uniq(p.accounts?.tiktok || []),
@@ -188,23 +215,34 @@ app.post("/jobs", async (req, res) => {
       created_at: nowISO(),
       state: "queued",
       progress: 0,
-      input: { source, preset, variations, targetPlatforms, accounts, soundStrategy, postingPolicy }
+      input: {
+        source: sourceType === "url" ? sourceUrl : "(base64)",
+        preset, variations, targetPlatforms, accounts, soundStrategy, postingPolicy
+      }
     });
 
-    // Svar med det samme, så UI får job_id
+    // Svar til UI med det samme
     res.status(201).json({ job_id: jobId, state: "queued", progress: 0 });
 
-    // Simpel simuleret pipeline:
-    // 35% — accepteret og i gang
+    // ---- Simpelt pipeline forløb ----
+
+    // 35%
     setTimeout(async () => {
       await dbUpdateState(jobId, "processing", 35);
       await notify(webhookStatusUrl, { job_id: jobId, state: "processing", progress: 35 });
     }, 600);
 
-    // 70% — hent kilde, upload til Storage (public), gem output
+    // 70% — hent buffer (URL eller base64) og upload til Storage
     setTimeout(async () => {
       try {
-        const buf = await fetchMp4ToBuffer(source);
+        let buf;
+        if (sourceType === "url") {
+          buf = await fetchMp4ToBuffer(sourceUrl);
+        } else {
+          buf = parseBase64Video(sourceB64);
+          if (!buf) throw new Error("invalid base64 input for video");
+        }
+
         const url = await uploadToStoragePublic(jobId, buf);
 
         const out = [{
@@ -248,7 +286,7 @@ app.get("/jobs/:job_id", async (req, res) => {
   }
 });
 
-// Valgfri: accepter også GET /jobs?id=<job_id> (gør frontend mere tolerant)
+// Valgfri tolerance: GET /jobs?id=<job_id>
 app.get("/jobs", async (req, res) => {
   const id = req.query.id || req.query.job_id;
   if (!id) return res.status(400).json({ error: "missing job_id" });
