@@ -1,23 +1,27 @@
-// index.js — EuropePush backend (Render + Supabase Storage)
-// Env: SUPABASE_URL, SUPABASE_SERVICE_KEY, API_KEY
+// index.js — EuropePush backend with FFmpeg processing + Supabase Storage
+// Env (Render): SUPABASE_URL, SUPABASE_SERVICE_KEY (service_role), API_KEY
 // Storage: Supabase public bucket "outputs"
 
 import express from "express";
 import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
+import ffmpeg from "ffmpeg-static";
+import { execa } from "execa";
+import fs from "fs/promises";
+import path from "path";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "50mb" })); // større payloads for base64
+app.use(express.json({ limit: "50mb" })); // allow base64 video payloads
 
 // ---------- ENV ----------
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
 const SUPABASE_SERVICE_KEY = (process.env.SUPABASE_SERVICE_KEY || "").trim();
 const API_KEY = (process.env.API_KEY || "").trim();
 
-console.log("🔧 ENV SUPABASE_URL:", !!SUPABASE_URL ? "present" : "MISSING");
-console.log("🔧 ENV SUPABASE_SERVICE_KEY:", !!SUPABASE_SERVICE_KEY ? "present" : "MISSING");
-console.log("🔧 ENV API_KEY:", !!API_KEY ? "present" : "MISSING");
+console.log("🔧 ENV SUPABASE_URL:", SUPABASE_URL ? "present" : "MISSING");
+console.log("🔧 ENV SUPABASE_SERVICE_KEY:", SUPABASE_SERVICE_KEY ? "present" : "MISSING");
+console.log("🔧 ENV API_KEY:", API_KEY ? "present" : "MISSING");
 
 const supabase = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
@@ -28,7 +32,7 @@ const nowISO = () => new Date().toISOString();
 const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
 const uniq = (arr) => [...new Set(arr || [])];
 
-// ---------- AUTH (x-api-key på POST /jobs) ----------
+// ---------- AUTH (x-api-key on POST /jobs) ----------
 app.use((req, res, next) => {
   if (req.method === "POST" && (req.path === "/jobs" || req.path === "/jobs/")) {
     const headerKey = (req.headers["x-api-key"] ?? "").toString().trim();
@@ -124,7 +128,6 @@ async function fetchMp4ToBuffer(url) {
 function parseBase64Video(input) {
   if (!input || typeof input !== "string") return null;
   let base64 = input.trim();
-  // data:video/mp4;base64,XXXX...
   const commaIdx = base64.indexOf(",");
   if (base64.startsWith("data:")) {
     if (commaIdx === -1) return null;
@@ -133,7 +136,7 @@ function parseBase64Video(input) {
   if (!/^[A-Za-z0-9+/=\s]+$/.test(base64)) return null;
   try {
     const buf = Buffer.from(base64, "base64");
-    if (buf.length < 10 * 1024) return null; // mindst ~10KB
+    if (buf.length < 10 * 1024) return null; // min ~10KB sanity
     return buf;
   } catch {
     return null;
@@ -141,16 +144,59 @@ function parseBase64Video(input) {
 }
 
 async function uploadToStoragePublic(jobId, buf) {
-  const path = `jobs/${jobId}/clip_v1.mp4`;
+  const pathKey = `jobs/${jobId}/clip_v1.mp4`;
   const { error: upErr } = await supabase
     .storage.from("outputs")
-    .upload(path, buf, { contentType: "video/mp4", upsert: true });
+    .upload(pathKey, buf, { contentType: "video/mp4", upsert: true });
   if (upErr) throw upErr;
-  const { data } = supabase.storage.from("outputs").getPublicUrl(path);
-  return data.publicUrl; // public bucket → direkte URL
+  const { data } = supabase.storage.from("outputs").getPublicUrl(pathKey);
+  return data.publicUrl; // direct URL (public bucket)
 }
 
-// ---------- UTIL ----------
+// ---------- FFmpeg HELPERS ----------
+const TMP_DIR = "/tmp";
+
+async function writeTemp(buf, filename) {
+  const p = path.join(TMP_DIR, filename);
+  await fs.writeFile(p, buf);
+  return p;
+}
+
+async function processVideoTo1080x1920(inPath, outPath, { hook = "ICEBERG drop i dag ❄️", watermark = "@europepush" } = {}) {
+  // Simple V1: scale+pad to 1080x1920 + two drawtext overlays (hook centered top, watermark top-left)
+  const vf =
+    "scale=w=1080:h=1920:force_original_aspect_ratio=decrease," +
+    "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2," +
+    `drawtext=text='${hook.replace(/:/g, '\\:').replace(/'/g, "\\'")}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.35:boxborderw=10:x=(w-text_w)/2:y=120,` +
+    `drawtext=text='${watermark.replace(/:/g, '\\:').replace(/'/g, "\\'")}':fontcolor=white@0.7:fontsize=28:x=40:y=80`;
+
+  const args = [
+    "-y",
+    "-i", inPath,
+    "-vf", vf,
+    "-c:v", "libx264",
+    "-profile:v", "high",
+    "-pix_fmt", "yuv420p",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-movflags", "+faststart",
+    outPath
+  ];
+
+  await execa(ffmpeg, args);
+}
+
+async function processBufferWithFFmpeg(buf, jobId, overlayOpts = {}) {
+  const inPath = await writeTemp(buf, `in_${jobId}.mp4`);
+  const outPath = path.join(TMP_DIR, `out_${jobId}.mp4`);
+  await processVideoTo1080x1920(inPath, outPath, overlayOpts);
+  const outBuf = await fs.readFile(outPath);
+  return outBuf;
+}
+
+// ---------- NOTIFY ----------
 async function notify(url, body) {
   try {
     if (!url || typeof url !== "string") return;
@@ -184,7 +230,7 @@ app.post("/jobs", async (req, res) => {
   try {
     const p = req.body || {};
 
-    // Kilde: enten URL (.mp4) eller base64
+    // Accept either URL (.mp4) or base64
     const sourceUrl = typeof p.source_video_url === "string" ? p.source_video_url.trim() : "";
     const sourceB64 = typeof p.source_video_base64 === "string" ? p.source_video_base64 : "";
 
@@ -221,29 +267,35 @@ app.post("/jobs", async (req, res) => {
       }
     });
 
-    // Svar til UI med det samme
+    // respond immediately so UI can start polling
     res.status(201).json({ job_id: jobId, state: "queued", progress: 0 });
 
-    // ---- Simpelt pipeline forløb ----
+    // ---- Simulated pipeline ----
 
-    // 35%
+    // 35% — accepted
     setTimeout(async () => {
       await dbUpdateState(jobId, "processing", 35);
       await notify(webhookStatusUrl, { job_id: jobId, state: "processing", progress: 35 });
     }, 600);
 
-    // 70% — hent buffer (URL eller base64) og upload til Storage
+    // 70% — fetch buffer (url/base64), process with FFmpeg, upload to Storage
     setTimeout(async () => {
       try {
-        let buf;
+        let srcBuf;
         if (sourceType === "url") {
-          buf = await fetchMp4ToBuffer(sourceUrl);
+          srcBuf = await fetchMp4ToBuffer(sourceUrl);
         } else {
-          buf = parseBase64Video(sourceB64);
-          if (!buf) throw new Error("invalid base64 input for video");
+          srcBuf = parseBase64Video(sourceB64);
+          if (!srcBuf) throw new Error("invalid base64 input for video");
         }
 
-        const url = await uploadToStoragePublic(jobId, buf);
+        // Simple V1 processing: 1080x1920 + hook + watermark
+        const editedBuf = await processBufferWithFFmpeg(srcBuf, jobId, {
+          hook: "ICEBERG drop i dag ❄️",
+          watermark: "@europepush"
+        });
+
+        const url = await uploadToStoragePublic(jobId, editedBuf);
 
         const out = [{
           url,
@@ -286,7 +338,7 @@ app.get("/jobs/:job_id", async (req, res) => {
   }
 });
 
-// Valgfri tolerance: GET /jobs?id=<job_id>
+// Optional tolerance: GET /jobs?id=<job_id>
 app.get("/jobs", async (req, res) => {
   const id = req.query.id || req.query.job_id;
   if (!id) return res.status(400).json({ error: "missing job_id" });
