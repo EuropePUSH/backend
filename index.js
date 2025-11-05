@@ -1,14 +1,13 @@
-// index.js — EuropePush backend (FFmpeg w/ safe drawtext, Supabase Storage, robust logs)
-// Env (Render): SUPABASE_URL, SUPABASE_SERVICE_KEY (service_role), API_KEY
-// Storage: Supabase public bucket "outputs"
-
+// index.js — low-RAM FFmpeg pipeline (streaming) + Supabase Storage
 import express from "express";
 import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
 import ffmpeg from "ffmpeg-static";
 import { execa } from "execa";
 import fs from "fs/promises";
+import fss from "fs";
 import path from "path";
+import { pipeline } from "stream/promises";
 
 const app = express();
 app.use(cors());
@@ -27,165 +26,133 @@ const supabase = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
   : null;
 
-// ---------- UTILS ----------
+const TMP_DIR = "/tmp";
 const nowISO = () => new Date().toISOString();
-const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
-const uniq = (arr) => [...new Set(arr || [])];
+const clamp = (n,a,b)=>Math.max(a,Math.min(b,n));
+const uniq = (arr)=>[...new Set(arr||[])];
 
-// ---------- AUTH (x-api-key on POST /jobs) ----------
-app.use((req, res, next) => {
-  if (req.method === "POST" && (req.path === "/jobs" || req.path === "/jobs/")) {
-    const headerKey = (req.headers["x-api-key"] ?? "").toString().trim();
-    if (!API_KEY || headerKey !== API_KEY) {
-      console.log("AUTH DEBUG:", {
-        env_len: API_KEY.length,
-        header_len: headerKey.length,
-        bearer_len: 0
-      });
-      return res.status(401).json({ error: "unauthorized" });
+// ---------- AUTH ----------
+app.use((req,res,next)=>{
+  if (req.method==="POST" && (req.path==="/jobs"||req.path==="/jobs/")){
+    const k=(req.headers["x-api-key"]??"").toString().trim();
+    if (!API_KEY || k!==API_KEY){
+      console.log("AUTH DEBUG:",{env_len:API_KEY.length,header_len:k.length});
+      return res.status(401).json({error:"unauthorized"});
     }
   }
   next();
 });
 
-// ---------- DB HELPERS ----------
-async function dbCreateJob(job) {
-  if (!supabase) throw new Error("supabase not configured");
+// ---------- DB ----------
+async function dbCreateJob(job){
   const { error } = await supabase.from("jobs").insert({
-    job_id: job.job_id,
-    state: job.state,
-    progress: job.progress,
-    input: job.input
+    job_id: job.job_id, state: job.state, progress: job.progress, input: job.input
   });
   if (error) throw error;
-
   const { error: e2 } = await supabase.from("job_events").insert({
-    job_id: job.job_id,
-    state: "queued",
-    progress: 0,
-    payload: { created_at: job.created_at }
+    job_id: job.job_id, state:"queued", progress:0, payload:{created_at:job.created_at}
   });
   if (e2) throw e2;
 }
 
-async function dbUpdateState(job_id, state, progress, payload = null) {
-  if (!supabase) throw new Error("supabase not configured");
-  const { error } = await supabase.from("jobs").update({ state, progress }).eq("job_id", job_id);
+async function dbUpdateState(job_id,state,progress,payload=null){
+  const { error } = await supabase.from("jobs").update({state,progress}).eq("job_id",job_id);
   if (error) throw error;
-  const { error: e2 } = await supabase.from("job_events").insert({ job_id, state, progress, payload });
+  const { error: e2 } = await supabase.from("job_events").insert({job_id,state,progress,payload});
   if (e2) throw e2;
 }
 
-async function dbSetOutputs(job_id, outputs) {
-  if (!supabase) throw new Error("supabase not configured");
+async function dbSetOutputs(job_id, outputs){
   await supabase.from("job_outputs").delete().eq("job_id", job_id);
-  const rows = outputs.map((o, i) => ({
-    job_id,
-    idx: i + 1,
-    url: o.url,
-    caption: o.caption || null,
-    hashtags: o.hashtags || null
-  }));
+  const rows = outputs.map((o,i)=>({ job_id, idx:i+1, url:o.url, caption:o.caption||null, hashtags:o.hashtags||null }));
   const { error } = await supabase.from("job_outputs").insert(rows);
   if (error) throw error;
 }
 
-async function dbGetJob(job_id) {
-  if (!supabase) throw new Error("supabase not configured");
-  const { data: job, error } = await supabase
-    .from("jobs").select("*").eq("job_id", job_id).maybeSingle();
+async function dbGetJob(job_id){
+  const { data: job, error } = await supabase.from("jobs").select("*").eq("job_id",job_id).maybeSingle();
   if (error) throw error;
   if (!job) return null;
-
-  const [{ data: outputs }, { data: events }] = await Promise.all([
-    supabase.from("job_outputs").select("*").eq("job_id", job_id).order("idx", { ascending: true }),
-    supabase.from("job_events").select("*").eq("job_id", job_id).order("id", { ascending: true })
+  const [{data:outs},{data:evs}] = await Promise.all([
+    supabase.from("job_outputs").select("*").eq("job_id",job_id).order("idx",{ascending:true}),
+    supabase.from("job_events").select("*").eq("job_id",job_id).order("id",{ascending:true}),
   ]);
-
   return {
     job_id,
     created_at: job.created_at,
     state: job.state,
     progress: job.progress,
     input: job.input || {},
-    outputs: (outputs || []).map(o => ({
-      id: o.idx, url: o.url, caption: o.caption, hashtags: o.hashtags
-    })),
-    events: (events || []).map(e => ({
-      at: e.at, state: e.state, progress: e.progress, payload: e.payload
-    }))
+    outputs: (outs||[]).map(o=>({id:o.idx,url:o.url,caption:o.caption,hashtags:o.hashtags})),
+    events: (evs||[]).map(e=>({at:e.at,state:e.state,progress:e.progress,payload:e.payload}))
   };
 }
 
-// ---------- STORAGE HELPERS ----------
-async function fetchMp4ToBuffer(url) {
+// ---------- STORAGE ----------
+async function uploadFilePathToStorage(jobId, filePath){
+  const key = `jobs/${jobId}/clip_v1.mp4`;
+  const fileStream = fss.createReadStream(filePath);
+  const stat = await fs.stat(filePath);
+  console.log("UPLOAD size bytes:", stat.size);
+
+  // Supabase SDK accepts a Readable in Node
+  const { error: upErr } = await supabase.storage.from("outputs").upload(key, fileStream, {
+    contentType: "video/mp4",
+    upsert: true
+  });
+  if (upErr) throw upErr;
+  const { data } = supabase.storage.from("outputs").getPublicUrl(key);
+  return data.publicUrl;
+}
+
+// Stream download to file (no big Buffer)
+async function downloadUrlToFile(url, outPath){
   const res = await fetch(url);
   if (!res.ok) throw new Error(`download failed: ${res.status}`);
-  const ab = await res.arrayBuffer();
-  return Buffer.from(ab);
+  const ws = fss.createWriteStream(outPath);
+  await pipeline(res.body, ws);
+  const { size } = await fs.stat(outPath);
+  console.log("Downloaded to file bytes:", size);
+  return outPath;
 }
 
-function parseBase64Video(input) {
-  if (!input || typeof input !== "string") return null;
-  let base64 = input.trim();
-  const commaIdx = base64.indexOf(",");
+// Write base64 (or data: URL) to file
+async function writeBase64ToFile(b64, outPath){
+  let base64 = b64.trim();
+  const comma = base64.indexOf(",");
   if (base64.startsWith("data:")) {
-    if (commaIdx === -1) return null;
-    base64 = base64.slice(commaIdx + 1);
+    if (comma === -1) throw new Error("invalid data URL");
+    base64 = base64.slice(comma+1);
   }
-  try {
-    const buf = Buffer.from(base64, "base64");
-    console.log("BASE64 decoded bytes:", buf.length);
-    return buf.length > 0 ? buf : null;
-  } catch (e) {
-    console.log("BASE64 decode error:", e.message);
-    return null;
-  }
+  const buf = Buffer.from(base64, "base64");
+  console.log("BASE64 decoded bytes:", buf.length);
+  await fs.writeFile(outPath, buf);
+  return outPath;
 }
 
-async function uploadToStoragePublic(jobId, buf) {
-  const pathKey = `jobs/${jobId}/clip_v1.mp4`;
-  const { error: upErr } = await supabase
-    .storage.from("outputs")
-    .upload(pathKey, buf, { contentType: "video/mp4", upsert: true });
-  if (upErr) throw upErr;
-  const { data } = supabase.storage.from("outputs").getPublicUrl(pathKey);
-  return data.publicUrl; // public bucket → direct URL
-}
-
-// ---------- FFmpeg HELPERS ----------
-const TMP_DIR = "/tmp";
-
-async function pickFontFile() {
-  // Prøv nogle standard-stier på “servere”
-  const candidates = [
+// ---------- FFmpeg ----------
+async function pickFontFile(){
+  const cands = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
   ];
-  for (const f of candidates) {
-    try {
-      await fs.access(f);
-      console.log("🅰️ drawtext font found:", f);
-      return f;
-    } catch { /* ignore */ }
+  for (const pth of cands){
+    try { await fs.access(pth); console.log("🅰️ drawtext font:", pth); return pth; } catch {}
   }
-  console.log("⚠️ No system font found for drawtext — will skip text overlays.");
+  console.log("⚠️ No system font found; skip drawtext.");
   return null;
 }
 
-function buildVfFilter({ hook, watermark, font }) {
-  // scale+pad altid (1080x1920)
+function vfChain({hook,watermark,font}){
   const chain = [
     "scale=w=1080:h=1920:force_original_aspect_ratio=decrease",
     "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2"
   ];
-
-  // drawtext kun hvis font findes
-  if (font) {
-    const safeHook = (hook || "ICEBERG drop i dag ❄️").replace(/:/g, "\\:").replace(/'/g, "\\'");
-    const safeWM = (watermark || "@europepush").replace(/:/g, "\\:").replace(/'/g, "\\'");
+  if (font){
+    const safeHook = (hook||"ICEBERG drop i dag ❄️").replace(/:/g,"\\:").replace(/'/g,"\\'");
+    const safeWM = (watermark||"@europepush").replace(/:/g,"\\:").replace(/'/g,"\\'");
     chain.push(
       `drawtext=fontfile='${font}':text='${safeHook}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.35:boxborderw=10:x=(w-text_w)/2:y=120`,
       `drawtext=fontfile='${font}':text='${safeWM}':fontcolor=white@0.7:fontsize=28:x=40:y=80`
@@ -194,212 +161,165 @@ function buildVfFilter({ hook, watermark, font }) {
   return chain.join(",");
 }
 
-async function processBufferWithFFmpeg(buf, jobId, overlayOpts = {}) {
-  const inPath = path.join(TMP_DIR, `in_${jobId}.mp4`);
-  const outPath = path.join(TMP_DIR, `out_${jobId}.mp4`);
-  await fs.writeFile(inPath, buf);
-
+async function runFfmpeg(inPath, outPath, overlays={}){
   const font = await pickFontFile();
-  const vf = buildVfFilter({
-    hook: overlayOpts.hook || "ICEBERG drop i dag ❄️",
-    watermark: overlayOpts.watermark || "@europepush",
-    font
-  });
-
+  const vf = vfChain({ hook: overlays.hook, watermark: overlays.watermark, font });
   const args = [
-    "-y",
-    "-hide_banner",
-    "-nostdin",
+    "-y", "-hide_banner", "-nostdin",
+    "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
     "-i", inPath,
     "-vf", vf,
-    "-c:v", "libx264",
-    "-profile:v", "high",
-    "-pix_fmt", "yuv420p",
-    "-preset", "veryfast",
-    "-crf", "23",
-    "-c:a", "aac",
-    "-b:a", "128k",
+    "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
+    "-preset", "veryfast", "-crf", "23",
+    "-c:a", "aac", "-b:a", "128k",
     "-movflags", "+faststart",
     outPath
   ];
-
   console.log("FFmpeg args:", args.join(" "));
   try {
     const { stdout, stderr } = await execa(ffmpeg, args, { all: true });
-    if (stdout) console.log("FFMPEG STDOUT:", stdout.slice(-4000));
-    if (stderr) console.log("FFMPEG STDERR:", stderr.slice(-4000));
-  } catch (err) {
+    if (stdout) console.log("FFMPEG OUT:", stdout.slice(-4000));
+    if (stderr) console.log("FFMPEG ERR:", stderr.slice(-4000));
+  } catch (err){
     console.error("❌ FFmpeg error:", err.message);
-    if (err.all) console.error("FFMPEG LAST LOGS:", String(err.all).slice(-8000));
+    if (err.all) console.error("FFMPEG LOGS:", String(err.all).slice(-8000));
     throw err;
   }
-
-  const outBuf = await fs.readFile(outPath);
-  console.log("FFmpeg output bytes:", outBuf.length);
-  return outBuf;
+  const { size } = await fs.stat(outPath);
+  console.log("FFmpeg output bytes:", size);
 }
 
-// ---------- NOTIFY ----------
-async function notify(url, body) {
-  try {
-    if (!url || typeof url !== "string") return;
-    if (!/^https?:\/\//i.test(url)) return;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body)
-    });
+// ---------- Notify ----------
+async function notify(url, body){
+  try{
+    if (!url || !/^https?:\/\//i.test(url)) return;
+    const res = await fetch(url,{ method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body) });
     if (!res.ok) console.log("⚠️ webhook non-200:", res.status);
-  } catch (e) {
-    console.log("⚠️ webhook notify failed:", e.message);
-  }
+  }catch(e){ console.log("⚠️ webhook notify failed:", e.message); }
 }
 
-// ---------- HEALTH ----------
-app.get("/", (_req, res) => res.json({ status: "API running" }));
-app.get("/health", async (_req, res) => {
-  try {
-    if (!supabase) throw new Error("supabase not configured");
-    const { error } = await supabase.from("jobs").select("count", { count: "exact", head: true });
+// ---------- Health ----------
+app.get("/", (_req,res)=>res.json({status:"API running"}));
+app.get("/health", async (_req,res)=>{
+  try{
+    const { error } = await supabase.from("jobs").select("count",{count:"exact",head:true});
     if (error) throw error;
-    res.json({ up: true, db: true });
-  } catch {
-    res.status(500).json({ up: true, db: false });
+    res.json({ up:true, db:true });
+  }catch{
+    res.status(500).json({ up:true, db:false });
   }
 });
 
-// ---------- JOBS ----------
-app.post("/jobs", async (req, res) => {
-  try {
+// ---------- Jobs ----------
+app.post("/jobs", async (req,res)=>{
+  try{
     const p = req.body || {};
-
-    // Accept URL (.mp4) or base64
-    const sourceUrl = typeof p.source_video_url === "string" ? p.source_video_url.trim() : "";
-    const sourceB64 = typeof p.source_video_base64 === "string" ? p.source_video_base64 : "";
-
-    let sourceType = null; // "url" | "base64"
-    if (sourceUrl && sourceUrl.toLowerCase().endsWith(".mp4")) {
-      sourceType = "url";
-    } else if (sourceB64) {
-      sourceType = "base64";
-    } else {
-      return res.status(400).json({ error: "Provide source_video_url (.mp4) OR source_video_base64 (data URL or raw base64)" });
-    }
+    const sourceUrl = typeof p.source_video_url==="string" ? p.source_video_url.trim() : "";
+    const sourceB64 = typeof p.source_video_base64==="string" ? p.source_video_base64 : "";
+    let sourceType=null;
+    if (sourceUrl && sourceUrl.toLowerCase().endsWith(".mp4")) sourceType="url";
+    else if (sourceB64) sourceType="base64";
+    else return res.status(400).json({error:"Provide source_video_url (.mp4) OR source_video_base64"});
 
     const preset = String(p.preset_id || "default");
-    const variations = clamp(parseInt(p.variations || 1, 10), 1, 50);
-    const targetPlatforms = uniq(p.target_platforms || []);
+    const variations = clamp(parseInt(p.variations||1,10),1,50);
+    const targetPlatforms = uniq(p.target_platforms||[]);
     const accounts = {
-      tiktok: uniq(p.accounts?.tiktok || []),
-      instagram: uniq(p.accounts?.instagram || []),
-      youtube: uniq(p.accounts?.youtube || [])
+      tiktok: uniq(p.accounts?.tiktok||[]),
+      instagram: uniq(p.accounts?.instagram||[]),
+      youtube: uniq(p.accounts?.youtube||[])
     };
-    const soundStrategy = p.sound_strategy || null;
-    const postingPolicy = p.posting_policy || null;
     const webhookStatusUrl = p.webhook_status_url || null;
+    const jobId = "job_" + Math.random().toString(36).slice(2,10);
 
-    const jobId = "job_" + Math.random().toString(36).slice(2, 10);
     await dbCreateJob({
-      job_id: jobId,
-      created_at: nowISO(),
-      state: "queued",
-      progress: 0,
-      input: {
-        source: sourceType === "url" ? sourceUrl : "(base64)",
-        preset, variations, targetPlatforms, accounts, soundStrategy, postingPolicy
-      }
+      job_id: jobId, created_at: nowISO(),
+      state:"queued", progress:0,
+      input:{ source: sourceType==="url"?sourceUrl:"(base64)", preset, variations, targetPlatforms, accounts }
     });
 
-    // respond immediately
     res.status(201).json({ job_id: jobId, state: "queued", progress: 0 });
 
-    // 35% — accepted
-    setTimeout(async () => {
-      await dbUpdateState(jobId, "processing", 35);
-      await notify(webhookStatusUrl, { job_id: jobId, state: "processing", progress: 35 });
-    }, 600);
+    // 35%
+    setTimeout(async ()=>{
+      await dbUpdateState(jobId,"processing",35);
+      await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:35});
+    },600);
 
-    // 70% — get buffer, run FFmpeg (with safe drawtext), upload (fallback to original on crash)
-    setTimeout(async () => {
-      try {
-        let srcBuf;
-        if (sourceType === "url") {
-          srcBuf = await fetchMp4ToBuffer(sourceUrl);
-          console.log("Downloaded source bytes:", srcBuf.length);
+    // 70% — stream to /tmp, FFmpeg, upload, cleanup
+    setTimeout(async ()=>{
+      const inPath = path.join(TMP_DIR, `in_${jobId}.mp4`);
+      const outPath = path.join(TMP_DIR, `out_${jobId}.mp4`);
+      try{
+        if (sourceType==="url") {
+          await downloadUrlToFile(sourceUrl, inPath);
         } else {
-          srcBuf = parseBase64Video(sourceB64);
-          if (!srcBuf) throw new Error("invalid base64 input for video");
+          await writeBase64ToFile(sourceB64, inPath);
         }
 
-        let editedBuf;
-        try {
-          editedBuf = await processBufferWithFFmpeg(srcBuf, jobId, {
-            hook: "ICEBERG drop i dag ❄️",
-            watermark: "@europepush"
-          });
-        } catch (fferr) {
-          console.error("FFmpeg failed, falling back to original buffer:", fferr.message);
-          editedBuf = srcBuf; // fallback → you still get a file
+        try{
+          await runFfmpeg(inPath, outPath, { hook:"ICEBERG drop i dag ❄️", watermark:"@europepush" });
+        }catch(fferr){
+          console.error("FFmpeg failed — using original file:", fferr.message);
+          await fs.copyFile(inPath, outPath);
         }
 
-        const url = await uploadToStoragePublic(jobId, editedBuf);
-
-        const out = [{
-          url,
-          caption: "ICEBERG drop ❄️ — Følg for mere",
-          hashtags: ["#europesnus", "#iceberg", "#fyp"]
-        }];
-
+        const url = await uploadFilePathToStorage(jobId, outPath);
+        const out = [{ url, caption: "ICEBERG drop ❄️ — Følg for mere", hashtags: ["#europesnus","#iceberg","#fyp"] }];
         await dbSetOutputs(jobId, out);
-        await dbUpdateState(jobId, "processing", 70, { outputs: out.map(o => o.url) });
-        await notify(webhookStatusUrl, { job_id: jobId, state: "processing", progress: 70, outputs: out.map(o => o.url) });
-
-      } catch (e) {
+        await dbUpdateState(jobId,"processing",70,{ outputs: out.map(o=>o.url) });
+        await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:70,outputs: out.map(o=>o.url) });
+      }catch(e){
         console.error("upload pipeline error:", e);
-        await dbUpdateState(jobId, "failed", 100, { error: String(e.message || e) });
-        await notify(webhookStatusUrl, { job_id: jobId, state: "failed", progress: 100, error: String(e.message || e) });
+        await dbUpdateState(jobId,"failed",100,{ error: String(e.message||e) });
+        await notify(webhookStatusUrl,{job_id:jobId,state:"failed",progress:100,error:String(e.message||e)});
         return;
+      }finally{
+        // cleanup temp files
+        for (const pth of [inPath, outPath]) {
+          try { await fs.unlink(pth); } catch {}
+        }
       }
-    }, 1800);
+    },1800);
 
-    // 100% — complete
-    setTimeout(async () => {
-      await dbUpdateState(jobId, "complete", 100);
-      await notify(webhookStatusUrl, { job_id: jobId, state: "complete", progress: 100 });
-    }, 3000);
+    // 100%
+    setTimeout(async ()=>{
+      await dbUpdateState(jobId,"complete",100);
+      await notify(webhookStatusUrl,{job_id:jobId,state:"complete",progress:100});
+    },3000);
 
-  } catch (err) {
+  }catch(err){
     console.error("❌ POST /jobs error:", err);
-    res.status(500).json({ error: "internal_error" });
+    res.status(500).json({ error:"internal_error" });
   }
 });
 
-// GET /jobs/:job_id — status + outputs
-app.get("/jobs/:job_id", async (req, res) => {
-  try {
+// GET /jobs/:job_id
+app.get("/jobs/:job_id", async (req,res)=>{
+  try{
     const job = await dbGetJob(req.params.job_id);
-    if (!job) return res.status(404).json({ error: "job not found" });
+    if (!job) return res.status(404).json({ error:"job not found" });
     res.json(job);
-  } catch (err) {
+  }catch(err){
     console.error("❌ GET /jobs/:id error:", err);
-    res.status(500).json({ error: "internal_error" });
+    res.status(500).json({ error:"internal_error" });
   }
 });
 
-// Optional tolerance: GET /jobs?id=<job_id>
-app.get("/jobs", async (req, res) => {
+// GET /jobs?id=<job_id>
+app.get("/jobs", async (req,res)=>{
   const id = req.query.id || req.query.job_id;
-  if (!id) return res.status(400).json({ error: "missing job_id" });
-  try {
+  if (!id) return res.status(400).json({ error:"missing job_id" });
+  try{
     const job = await dbGetJob(String(id));
-    if (!job) return res.status(404).json({ error: "job not found" });
+    if (!job) return res.status(404).json({ error:"job not found" });
     res.json(job);
-  } catch (err) {
+  }catch(err){
     console.error("❌ GET /jobs (query) error:", err);
-    res.status(500).json({ error: "internal_error" });
+    res.status(500).json({ error:"internal_error" });
   }
 });
 
 // ---------- START ----------
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`✅ Server on ${PORT}`));
+app.listen(PORT, ()=>console.log(`✅ Server on ${PORT}`));
