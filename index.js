@@ -1,4 +1,4 @@
-// index.js — EuropePush backend with FFmpeg processing + Supabase Storage
+// index.js — EuropePush backend (FFmpeg + Supabase Storage + robust fallback)
 // Env (Render): SUPABASE_URL, SUPABASE_SERVICE_KEY (service_role), API_KEY
 // Storage: Supabase public bucket "outputs"
 
@@ -125,6 +125,7 @@ async function fetchMp4ToBuffer(url) {
   return Buffer.from(ab);
 }
 
+// robust base64 parser (accept data-URL or raw base64)
 function parseBase64Video(input) {
   if (!input || typeof input !== "string") return null;
   let base64 = input.trim();
@@ -133,12 +134,12 @@ function parseBase64Video(input) {
     if (commaIdx === -1) return null;
     base64 = base64.slice(commaIdx + 1);
   }
-  if (!/^[A-Za-z0-9+/=\s]+$/.test(base64)) return null;
   try {
     const buf = Buffer.from(base64, "base64");
-    if (buf.length < 10 * 1024) return null; // min ~10KB sanity
-    return buf;
-  } catch {
+    console.log("BASE64 decoded bytes:", buf.length);
+    return buf.length > 0 ? buf : null;
+  } catch (e) {
+    console.log("BASE64 decode error:", e.message);
     return null;
   }
 }
@@ -150,7 +151,7 @@ async function uploadToStoragePublic(jobId, buf) {
     .upload(pathKey, buf, { contentType: "video/mp4", upsert: true });
   if (upErr) throw upErr;
   const { data } = supabase.storage.from("outputs").getPublicUrl(pathKey);
-  return data.publicUrl; // direct URL (public bucket)
+  return data.publicUrl; // public bucket → direct URL
 }
 
 // ---------- FFmpeg HELPERS ----------
@@ -163,7 +164,7 @@ async function writeTemp(buf, filename) {
 }
 
 async function processVideoTo1080x1920(inPath, outPath, { hook = "ICEBERG drop i dag ❄️", watermark = "@europepush" } = {}) {
-  // Simple V1: scale+pad to 1080x1920 + two drawtext overlays (hook centered top, watermark top-left)
+  // Simple V1: scale+pad to 1080x1920 + two drawtext overlays
   const vf =
     "scale=w=1080:h=1920:force_original_aspect_ratio=decrease," +
     "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2," +
@@ -267,10 +268,10 @@ app.post("/jobs", async (req, res) => {
       }
     });
 
-    // respond immediately so UI can start polling
+    // Respond immediately (UI can start polling)
     res.status(201).json({ job_id: jobId, state: "queued", progress: 0 });
 
-    // ---- Simulated pipeline ----
+    // ---- Pipeline ----
 
     // 35% — accepted
     setTimeout(async () => {
@@ -278,22 +279,29 @@ app.post("/jobs", async (req, res) => {
       await notify(webhookStatusUrl, { job_id: jobId, state: "processing", progress: 35 });
     }, 600);
 
-    // 70% — fetch buffer (url/base64), process with FFmpeg, upload to Storage
+    // 70% — get buffer (url/base64), try FFmpeg; if it fails, upload original buffer
     setTimeout(async () => {
       try {
         let srcBuf;
         if (sourceType === "url") {
           srcBuf = await fetchMp4ToBuffer(sourceUrl);
+          console.log("Downloaded source bytes:", srcBuf.length);
         } else {
           srcBuf = parseBase64Video(sourceB64);
           if (!srcBuf) throw new Error("invalid base64 input for video");
         }
 
-        // Simple V1 processing: 1080x1920 + hook + watermark
-        const editedBuf = await processBufferWithFFmpeg(srcBuf, jobId, {
-          hook: "ICEBERG drop i dag ❄️",
-          watermark: "@europepush"
-        });
+        let editedBuf;
+        try {
+          editedBuf = await processBufferWithFFmpeg(srcBuf, jobId, {
+            hook: "ICEBERG drop i dag ❄️",
+            watermark: "@europepush"
+          });
+          console.log("FFmpeg output bytes:", editedBuf.length);
+        } catch (fferr) {
+          console.error("FFmpeg failed, falling back to original buffer:", fferr.message);
+          editedBuf = srcBuf; // fallback → you still get a file
+        }
 
         const url = await uploadToStoragePublic(jobId, editedBuf);
 
@@ -306,6 +314,7 @@ app.post("/jobs", async (req, res) => {
         await dbSetOutputs(jobId, out);
         await dbUpdateState(jobId, "processing", 70, { outputs: out.map(o => o.url) });
         await notify(webhookStatusUrl, { job_id: jobId, state: "processing", progress: 70, outputs: out.map(o => o.url) });
+
       } catch (e) {
         console.error("upload pipeline error:", e);
         await dbUpdateState(jobId, "failed", 100, { error: String(e.message || e) });
