@@ -1,4 +1,4 @@
-// index.js — EuropePush backend (FFmpeg + Supabase Storage + robust fallback)
+// index.js — EuropePush backend (FFmpeg w/ safe drawtext, Supabase Storage, robust logs)
 // Env (Render): SUPABASE_URL, SUPABASE_SERVICE_KEY (service_role), API_KEY
 // Storage: Supabase public bucket "outputs"
 
@@ -12,7 +12,7 @@ import path from "path";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "50mb" })); // allow base64 video payloads
+app.use(express.json({ limit: "50mb" })); // allow base64 payloads
 
 // ---------- ENV ----------
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
@@ -125,7 +125,6 @@ async function fetchMp4ToBuffer(url) {
   return Buffer.from(ab);
 }
 
-// robust base64 parser (accept data-URL or raw base64)
 function parseBase64Video(input) {
   if (!input || typeof input !== "string") return null;
   let base64 = input.trim();
@@ -157,22 +156,60 @@ async function uploadToStoragePublic(jobId, buf) {
 // ---------- FFmpeg HELPERS ----------
 const TMP_DIR = "/tmp";
 
-async function writeTemp(buf, filename) {
-  const p = path.join(TMP_DIR, filename);
-  await fs.writeFile(p, buf);
-  return p;
+async function pickFontFile() {
+  // Prøv nogle standard-stier på “servere”
+  const candidates = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+  ];
+  for (const f of candidates) {
+    try {
+      await fs.access(f);
+      console.log("🅰️ drawtext font found:", f);
+      return f;
+    } catch { /* ignore */ }
+  }
+  console.log("⚠️ No system font found for drawtext — will skip text overlays.");
+  return null;
 }
 
-async function processVideoTo1080x1920(inPath, outPath, { hook = "ICEBERG drop i dag ❄️", watermark = "@europepush" } = {}) {
-  // Simple V1: scale+pad to 1080x1920 + two drawtext overlays
-  const vf =
-    "scale=w=1080:h=1920:force_original_aspect_ratio=decrease," +
-    "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2," +
-    `drawtext=text='${hook.replace(/:/g, '\\:').replace(/'/g, "\\'")}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.35:boxborderw=10:x=(w-text_w)/2:y=120,` +
-    `drawtext=text='${watermark.replace(/:/g, '\\:').replace(/'/g, "\\'")}':fontcolor=white@0.7:fontsize=28:x=40:y=80`;
+function buildVfFilter({ hook, watermark, font }) {
+  // scale+pad altid (1080x1920)
+  const chain = [
+    "scale=w=1080:h=1920:force_original_aspect_ratio=decrease",
+    "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2"
+  ];
+
+  // drawtext kun hvis font findes
+  if (font) {
+    const safeHook = (hook || "ICEBERG drop i dag ❄️").replace(/:/g, "\\:").replace(/'/g, "\\'");
+    const safeWM = (watermark || "@europepush").replace(/:/g, "\\:").replace(/'/g, "\\'");
+    chain.push(
+      `drawtext=fontfile='${font}':text='${safeHook}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.35:boxborderw=10:x=(w-text_w)/2:y=120`,
+      `drawtext=fontfile='${font}':text='${safeWM}':fontcolor=white@0.7:fontsize=28:x=40:y=80`
+    );
+  }
+  return chain.join(",");
+}
+
+async function processBufferWithFFmpeg(buf, jobId, overlayOpts = {}) {
+  const inPath = path.join(TMP_DIR, `in_${jobId}.mp4`);
+  const outPath = path.join(TMP_DIR, `out_${jobId}.mp4`);
+  await fs.writeFile(inPath, buf);
+
+  const font = await pickFontFile();
+  const vf = buildVfFilter({
+    hook: overlayOpts.hook || "ICEBERG drop i dag ❄️",
+    watermark: overlayOpts.watermark || "@europepush",
+    font
+  });
 
   const args = [
     "-y",
+    "-hide_banner",
+    "-nostdin",
     "-i", inPath,
     "-vf", vf,
     "-c:v", "libx264",
@@ -186,14 +223,19 @@ async function processVideoTo1080x1920(inPath, outPath, { hook = "ICEBERG drop i
     outPath
   ];
 
-  await execa(ffmpeg, args);
-}
+  console.log("FFmpeg args:", args.join(" "));
+  try {
+    const { stdout, stderr } = await execa(ffmpeg, args, { all: true });
+    if (stdout) console.log("FFMPEG STDOUT:", stdout.slice(-4000));
+    if (stderr) console.log("FFMPEG STDERR:", stderr.slice(-4000));
+  } catch (err) {
+    console.error("❌ FFmpeg error:", err.message);
+    if (err.all) console.error("FFMPEG LAST LOGS:", String(err.all).slice(-8000));
+    throw err;
+  }
 
-async function processBufferWithFFmpeg(buf, jobId, overlayOpts = {}) {
-  const inPath = await writeTemp(buf, `in_${jobId}.mp4`);
-  const outPath = path.join(TMP_DIR, `out_${jobId}.mp4`);
-  await processVideoTo1080x1920(inPath, outPath, overlayOpts);
   const outBuf = await fs.readFile(outPath);
+  console.log("FFmpeg output bytes:", outBuf.length);
   return outBuf;
 }
 
@@ -231,7 +273,7 @@ app.post("/jobs", async (req, res) => {
   try {
     const p = req.body || {};
 
-    // Accept either URL (.mp4) or base64
+    // Accept URL (.mp4) or base64
     const sourceUrl = typeof p.source_video_url === "string" ? p.source_video_url.trim() : "";
     const sourceB64 = typeof p.source_video_base64 === "string" ? p.source_video_base64 : "";
 
@@ -268,10 +310,8 @@ app.post("/jobs", async (req, res) => {
       }
     });
 
-    // Respond immediately (UI can start polling)
+    // respond immediately
     res.status(201).json({ job_id: jobId, state: "queued", progress: 0 });
-
-    // ---- Pipeline ----
 
     // 35% — accepted
     setTimeout(async () => {
@@ -279,7 +319,7 @@ app.post("/jobs", async (req, res) => {
       await notify(webhookStatusUrl, { job_id: jobId, state: "processing", progress: 35 });
     }, 600);
 
-    // 70% — get buffer (url/base64), try FFmpeg; if it fails, upload original buffer
+    // 70% — get buffer, run FFmpeg (with safe drawtext), upload (fallback to original on crash)
     setTimeout(async () => {
       try {
         let srcBuf;
@@ -297,7 +337,6 @@ app.post("/jobs", async (req, res) => {
             hook: "ICEBERG drop i dag ❄️",
             watermark: "@europepush"
           });
-          console.log("FFmpeg output bytes:", editedBuf.length);
         } catch (fferr) {
           console.error("FFmpeg failed, falling back to original buffer:", fferr.message);
           editedBuf = srcBuf; // fallback → you still get a file
