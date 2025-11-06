@@ -1,4 +1,4 @@
-// index.js — EuropePush backend (DEDUPER, audio=copy) + low-RAM + single-flight + light mode
+// index.js — EuropePush backend (NO-AUDIO-TOUCH, SAFE anti-duplicate, 1 output/account)
 import express from "express";
 import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
@@ -17,10 +17,12 @@ app.use(express.json({ limit: "50mb" }));
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
 const SUPABASE_SERVICE_KEY = (process.env.SUPABASE_SERVICE_KEY || "").trim();
 const API_KEY = (process.env.API_KEY || "").trim();
+const VIDEO_JITTER = String(process.env.VIDEO_JITTER || "true").toLowerCase() !== "false";
 
 console.log("🔧 ENV SUPABASE_URL:", SUPABASE_URL ? "present" : "MISSING");
 console.log("🔧 ENV SUPABASE_SERVICE_KEY:", SUPABASE_SERVICE_KEY ? "present" : "MISSING");
 console.log("🔧 ENV API_KEY:", API_KEY ? "present" : "MISSING");
+console.log("🔧 ENV VIDEO_JITTER:", VIDEO_JITTER);
 
 const supabase = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
@@ -28,7 +30,6 @@ const supabase = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
 
 const TMP_DIR = "/tmp";
 const nowISO = () => new Date().toISOString();
-const clamp = (n,a,b)=>Math.max(a,Math.min(b,n));
 const uniq = (arr)=>[...new Set(arr||[])];
 
 // ---------- AUTH ----------
@@ -54,21 +55,18 @@ async function dbCreateJob(job){
   });
   if (e2) throw e2;
 }
-
 async function dbUpdateState(job_id,state,progress,payload=null){
   const { error } = await supabase.from("jobs").update({state,progress}).eq("job_id",job_id);
   if (error) throw error;
   const { error: e2 } = await supabase.from("job_events").insert({job_id,state,progress,payload});
   if (e2) throw e2;
 }
-
 async function dbSetOutputs(job_id, outputs){
   await supabase.from("job_outputs").delete().eq("job_id", job_id);
   const rows = outputs.map((o,i)=>({ job_id, idx:i+1, url:o.url, caption:o.caption||null, hashtags:o.hashtags||null }));
   const { error } = await supabase.from("job_outputs").insert(rows);
   if (error) throw error;
 }
-
 async function dbGetJob(job_id){
   const { data: job, error } = await supabase.from("jobs").select("*").eq("job_id",job_id).maybeSingle();
   if (error) throw error;
@@ -89,9 +87,7 @@ async function dbGetJob(job_id){
 }
 
 // ---------- STORAGE ----------
-async function uploadFilePathToStorage(jobId, filePath){
-  const key = `jobs/${jobId}/clip_v1.mp4`;
-  const buf = await fs.readFile(filePath); // buffer upload (stabil på Node 18+)
+async function uploadBufferToStorage(key, buf){
   console.log("UPLOAD buffer bytes:", buf.length);
   const { error: upErr } = await supabase.storage.from("outputs").upload(key, buf, {
     contentType: "video/mp4",
@@ -100,6 +96,10 @@ async function uploadFilePathToStorage(jobId, filePath){
   if (upErr) throw upErr;
   const { data } = supabase.storage.from("outputs").getPublicUrl(key);
   return data.publicUrl;
+}
+async function uploadFilePathToStorage(key, filePath){
+  const buf = await fs.readFile(filePath);
+  return uploadBufferToStorage(key, buf);
 }
 
 async function downloadUrlToFile(url, outPath){
@@ -111,7 +111,6 @@ async function downloadUrlToFile(url, outPath){
   console.log("Downloaded to file bytes:", size);
   return outPath;
 }
-
 async function writeBase64ToFile(b64, outPath){
   let base64 = (b64||"").trim();
   const comma = base64.indexOf(",");
@@ -125,7 +124,7 @@ async function writeBase64ToFile(b64, outPath){
   return outPath;
 }
 
-// ---------- SINGLE-FLIGHT (1 job ad gangen) ----------
+// ---------- SINGLE-FLIGHT ----------
 let processingLock = false;
 async function withSingleFlight(fn) {
   while (processingLock) { await new Promise(r => setTimeout(r, 400)); }
@@ -134,83 +133,64 @@ async function withSingleFlight(fn) {
   finally { processingLock = false; }
 }
 
-// ---------- FFmpeg (DEDUPER: no text; audio=copy) ----------
-function vfChainDedupe({ jitterSeed = 0, light = false }) {
-  const px = 2 + (jitterSeed % 5); // 2..6 px crop
-  const chain = [
-    "scale=w=1080:h=1920:force_original_aspect_ratio=decrease",
-    "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2",
-    `crop=1080-${px*2}:1920-${px*2}:${px}:${px}`,
-    "pad=1080:1920:(1080-iw)/2:(1920-ih)/2",
-  ];
-  if (!light) {
-    const hueDeg = 0.3 + (jitterSeed % 3)*0.1;  // lille hue-shift
-    const noiseStrength = 1;                    // lav film-grain
-    chain.push(`hue=h=${hueDeg}*PI/180:s=1`, `noise=alls=${noiseStrength}:allf=t`);
-  }
-  return chain.join(",");
+// ---------- VF chain (HQ scale + micro-crop/pad; optional video-only setpts jitter) ----------
+function vfChainNoAudioTouch({ jitterSeed = 0, enableJitter = true }) {
+  const px = 2 + (jitterSeed % 5); // 2..6 px micro-crop
+  const scaleHQ = "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int";
+  const padFit = "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2";
+  const crop   = `crop=1080-${px*2}:1920-${px*2}:${px}:${px}`;
+  const padOut = "pad=1080:1920:(1080-iw)/2:(1920-ih)/2";
+
+  // tiny video-only timing nudge (breaks frame/GOP hash, invisible to eye)
+  // 0.999–1.001 variation
+  const jitterFactor = 0.999 + ((jitterSeed % 3) * 0.001);
+  const setpts = `setpts=${jitterFactor}*PTS`;
+
+  return [scaleHQ, padFit, crop, padOut, ...(enableJitter ? [setpts] : [])].join(",");
 }
 
-async function runFfmpeg(inPath, outPath, jobId = "job", opts = {}) {
-  // deterministisk seed ud fra jobId
-  let seed = 0;
-  for (const ch of String(jobId)) seed = (seed * 31 + ch.charCodeAt(0)) >>> 0;
+// ---------- FFmpeg runner (video re-encode; audio COPY; fallback = remux only) ----------
+async function runFfmpegVideoOnly(inPath, outPath, seed, light = false) {
+  const vf = vfChainNoAudioTouch({ jitterSeed: seed, enableJitter: VIDEO_JITTER });
 
-  const vf = vfChainDedupe({ jitterSeed: seed, light: !!opts.light });
-
-  // Første forsøg: audio 1:1 (copy) for at bevare lyd fingerprint
-  const argsCopy = [
+  // Quality-first encoder, conservative to avoid artifacts
+  const args = [
     "-y","-hide_banner","-nostdin",
     "-threads","1","-filter_threads","1","-filter_complex_threads","1",
     "-i", inPath,
     "-vf", vf,
+    "-map","0:v:0","-map","0:a:0",   // keep original audio track
     "-c:v","libx264","-profile:v","high","-pix_fmt","yuv420p",
-    "-preset", opts.light ? "ultrafast" : "veryfast",
-    "-crf","23",
-    "-c:a","copy",
+    "-preset", light ? "fast" : "medium",
+    "-crf", light ? "20" : "19",
+    "-tune","film",
+    "-x264-params","keyint=180:min-keyint=36:scenecut=0:bframes=3:ref=3:rc-lookahead=20",
+    "-c:a","copy",                    // <-- NO AUDIO TOUCH
     "-movflags","+faststart",
     outPath
   ];
 
-  // Light mode bitrate cap (store filer → mindre CPU)
-  if (opts.light) {
-    const i = argsCopy.indexOf("-crf");
-    if (i !== -1) {
-      argsCopy.splice(i+2, 0, "-maxrate","2500k","-bufsize","5000k");
-    }
+  // Light-mode mild VBV to protect low RAM instances
+  if (light) {
+    const i = args.indexOf("-crf");
+    if (i !== -1) args.splice(i+2, 0, "-maxrate","4000k","-bufsize","8000k");
   }
 
-  console.log("FFmpeg (dedupe, audio=copy) args:", argsCopy.join(" "));
+  console.log("FFmpeg (NO-AUDIO, safe) args:", args.join(" "));
   try {
-    const { stdout, stderr } = await execa(ffmpeg, argsCopy, { all: true, timeout: 300000 });
+    const { stdout, stderr } = await execa(ffmpeg, args, { all: true, timeout: 300000 });
     if (stdout) console.log("FFMPEG OUT:", stdout.slice(-4000));
     if (stderr) console.log("FFMPEG ERR:", stderr.slice(-4000));
   } catch (err) {
-    console.error("⚠️ FFmpeg copy failed, retry AAC:", err.message);
-    if (err.all) console.error("FFMPEG LOGS (copy):", String(err.all).slice(-8000));
-
-    const argsAac = [
+    console.error("⚠️ FFmpeg video encode failed. Fallback to REMUX (copy streams):", err.message);
+    // Fallback: remux both streams (changes container atoms; still breaks byte-level dupes; audio untouched)
+    const remuxArgs = [
       "-y","-hide_banner","-nostdin",
-      "-threads","1","-filter_threads","1","-filter_complex_threads","1",
       "-i", inPath,
-      "-vf", vf,
-      "-c:v","libx264","-profile:v","high","-pix_fmt","yuv420p",
-      "-preset", opts.light ? "ultrafast" : "veryfast",
-      "-crf","23",
-      "-c:a","aac","-b:a","128k",
-      "-movflags","+faststart",
+      "-c","copy","-movflags","+faststart",
       outPath
     ];
-    if (opts.light) {
-      const i2 = argsAac.indexOf("-crf");
-      if (i2 !== -1) {
-        argsAac.splice(i2+2, 0, "-maxrate","2500k","-bufsize","5000k");
-      }
-    }
-    console.log("FFmpeg (dedupe, aac fallback) args:", argsAac.join(" "));
-    const { stdout, stderr } = await execa(ffmpeg, argsAac, { all: true, timeout: 300000 });
-    if (stdout) console.log("FFMPEG OUT (aac):", stdout.slice(-4000));
-    if (stderr) console.log("FFMPEG ERR (aac):", stderr.slice(-4000));
+    await execa(ffmpeg, remuxArgs, { all: true, timeout: 120000 });
   }
 
   const { size } = await fs.stat(outPath);
@@ -238,7 +218,7 @@ app.get("/health", async (_req,res)=>{
   }
 });
 
-// ---------- Jobs ----------
+// ---------- Jobs (1 output pr. valgt account) ----------
 app.post("/jobs", async (req, res) => {
   try{
     const p = req.body || {};
@@ -249,21 +229,31 @@ app.post("/jobs", async (req, res) => {
     else if (sourceB64) sourceType="base64";
     else return res.status(400).json({error:"Provide source_video_url (.mp4) OR source_video_base64"});
 
-    const preset = String(p.preset_id || "dedupe");
-    const variations = clamp(parseInt(p.variations||1,10),1,50);
-    const targetPlatforms = uniq(p.target_platforms||[]);
     const accounts = {
       tiktok: uniq(p.accounts?.tiktok||[]),
       instagram: uniq(p.accounts?.instagram||[]),
-      youtube: uniq(p.accounts?.youtube||[])}
-    ;
+      youtube: uniq(p.accounts?.youtube||[])
+    };
+    const targets = [
+      ...accounts.tiktok.map(a=>({ platform:"tiktok", account:a })),
+      ...accounts.instagram.map(a=>({ platform:"instagram", account:a })),
+      ...accounts.youtube.map(a=>({ platform:"youtube", account:a })),
+    ];
+    const preset = String(p.preset_id || "no-audio-touch");
     const webhookStatusUrl = p.webhook_status_url || null;
     const jobId = "job_" + Math.random().toString(36).slice(2,10);
 
     await dbCreateJob({
       job_id: jobId, created_at: nowISO(),
       state:"queued", progress:0,
-      input:{ source: sourceType==="url"?sourceUrl:"(base64)", preset, variations, targetPlatforms, accounts, mode:"dedupe" }
+      input:{
+        source: sourceType==="url"?sourceUrl:"(base64)",
+        preset,
+        accounts,
+        targets_count: targets.length || 1,
+        mode:"no-audio-touch",
+        jitter: VIDEO_JITTER
+      }
     });
 
     res.status(201).json({ job_id: jobId, state: "queued", progress: 0 });
@@ -274,39 +264,50 @@ app.post("/jobs", async (req, res) => {
       await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:35});
     },600);
 
-    // 70% — stream, ffmpeg (dedupe), upload (single-flight + light mode for big inputs)
+    // 70% — download, ffmpeg per account, upload (single-flight)
     setTimeout(async ()=>{
       await withSingleFlight(async ()=>{
         const inPath = path.join(TMP_DIR, `in_${jobId}.mp4`);
-        const outPath = path.join(TMP_DIR, `out_${jobId}.mp4`);
         try{
           if (sourceType==="url") await downloadUrlToFile(sourceUrl, inPath);
           else await writeBase64ToFile(sourceB64, inPath);
 
-          // Light mode ved store filer (>15MB)
           const { size } = await fs.stat(inPath);
-          const light = size > 15 * 1024 * 1024;
+          const light = size > 25 * 1024 * 1024; // big inputs → lighter preset/CRF
 
-          try{
-            await runFfmpeg(inPath, outPath, jobId, { light });
-          }catch(fferr){
-            console.error("FFmpeg failed — using original file:", fferr.message);
-            await fs.copyFile(inPath, outPath);
+          const targetsEff = (targets.length>0) ? targets : [{ platform:"generic", account:"default" }];
+          const outputs = [];
+
+          for (const t of targetsEff){
+            // deterministic seed per platform/account
+            const seedStr = `${jobId}_${t.platform}_${t.account}`;
+            let seed = 0; for (const ch of seedStr) seed = (seed * 31 + ch.charCodeAt(0)) >>> 0;
+
+            const outPath = path.join(TMP_DIR, `out_${jobId}_${t.platform}_${t.account}.mp4`);
+            try{
+              await runFfmpegVideoOnly(inPath, outPath, seed, light);
+            }catch(fferr){
+              console.error(`FFmpeg failed for ${t.platform}/${t.account} — final fallback remux:`, fferr.message);
+              // last resort already done in runner; ensure file exists
+              try { await fs.access(outPath); } catch { await fs.copyFile(inPath, outPath); }
+            }
+
+            const key = `jobs/${jobId}/clip_${t.platform}_${t.account}.mp4`;
+            const url = await uploadFilePathToStorage(key, outPath);
+            outputs.push({ url, caption: null, hashtags: null });
+            try { await fs.unlink(outPath); } catch {}
           }
 
-          const url = await uploadFilePathToStorage(jobId, outPath);
-          const out = [{ url, caption: null, hashtags: null }];
-
-          await dbSetOutputs(jobId, out);
-          await dbUpdateState(jobId,"processing",70,{ outputs: out.map(o=>o.url) });
-          await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:70,outputs: out.map(o=>o.url) });
+          await dbSetOutputs(jobId, outputs);
+          await dbUpdateState(jobId,"processing",70,{ outputs: outputs.map(o=>o.url) });
+          await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:70,outputs: outputs.map(o=>o.url) });
         }catch(e){
           console.error("upload pipeline error:", e);
           await dbUpdateState(jobId,"failed",100,{ error: String(e.message||e) });
           await notify(webhookStatusUrl,{job_id:jobId,state:"failed",progress:100,error:String(e.message||e)});
           return;
         }finally{
-          for (const pth of [inPath, outPath]) { try { await fs.unlink(pth); } catch {} }
+          try { await fs.unlink(inPath); } catch {}
         }
       });
     },1800);
@@ -334,7 +335,6 @@ app.get("/jobs/:job_id", async (req,res)=>{
     res.status(500).json({ error:"internal_error" });
   }
 });
-
 app.get("/jobs", async (req,res)=>{
   const id = req.query.id || req.query.job_id;
   if (!id) return res.status(400).json({ error:"missing job_id" });
