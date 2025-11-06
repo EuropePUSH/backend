@@ -91,16 +91,17 @@ async function dbGetJob(job_id){
 // ---------- STORAGE ----------
 async function uploadFilePathToStorage(jobId, filePath){
   const key = `jobs/${jobId}/clip_v1.mp4`;
-  const fileStream = fss.createReadStream(filePath);
-  const stat = await fs.stat(filePath);
-  console.log("UPLOAD size bytes:", stat.size);
 
-  // Supabase SDK accepts a Readable in Node
-  const { error: upErr } = await supabase.storage.from("outputs").upload(key, fileStream, {
+  // Læs filen til RAM som Buffer (fixer duplex/stream-problemet)
+  const buf = await fs.readFile(filePath);
+  console.log("UPLOAD buffer bytes:", buf.length);
+
+  const { error: upErr } = await supabase.storage.from("outputs").upload(key, buf, {
     contentType: "video/mp4",
     upsert: true
   });
   if (upErr) throw upErr;
+
   const { data } = supabase.storage.from("outputs").getPublicUrl(key);
   return data.publicUrl;
 }
