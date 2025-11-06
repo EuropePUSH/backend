@@ -125,12 +125,12 @@ async function writeBase64ToFile(b64, outPath){
   return outPath;
 }
 
-// ---------- FFmpeg (DEDUPER: no text) ----------
+// ---------- FFmpeg (DEDUPER: no text; audio=copy) ----------
 function vfChainDedupe({ jitterSeed = 0 }) {
   // mikro-ændringer for at bryde perceptual hash uden synlig forskel
-  const px = 2 + (jitterSeed % 5);         // 2..6 px crop fra hver kant
-  const hueDeg = 0.3 + (jitterSeed % 3)*0.1; // 0.3..0.5 grader hue-shift
-  const noiseStrength = 1;                 // lav film-grain
+  const px = 2 + (jitterSeed % 5);            // 2..6 px crop fra hver kant
+  const hueDeg = 0.3 + (jitterSeed % 3)*0.1;  // 0.3..0.5 grader hue-shift
+  const noiseStrength = 1;                    // lav film-grain
 
   return [
     "scale=w=1080:h=1920:force_original_aspect_ratio=decrease",
@@ -149,38 +149,46 @@ async function runFfmpeg(inPath, outPath, jobId = "job"){
 
   const vf = vfChainDedupe({ jitterSeed: seed });
 
-  // lyd: tiny fade in/out + 0.99x tempo (næsten usynligt, bryder audio hash)
-  const af = [
-    "atrim=start=0",
-    "asetpts=N/SR/TB",
-    "afade=t=in:ss=0:d=0.03",
-    "afade=t=out:st=TN-0.03:d=0.03",
-    "atempo=0.99"
-  ].join(",");
-
-  const args = [
+  // 1) forsøg med audio=copy (bevar lyd bit-for-bit → bedst for TikTok sound match)
+  let argsCopy = [
     "-y", "-hide_banner", "-nostdin",
     "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
     "-i", inPath,
     "-vf", vf,
-    "-af", af,
     "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
     "-preset", "veryfast", "-crf", "23",
-    "-c:a", "aac", "-b:a", "128k",
+    "-c:a", "copy",
     "-movflags", "+faststart",
     outPath
   ];
 
-  console.log("FFmpeg (dedupe) args:", args.join(" "));
+  console.log("FFmpeg (dedupe, audio=copy) args:", argsCopy.join(" "));
   try {
-    const { stdout, stderr } = await execa(ffmpeg, args, { all: true });
+    const { stdout, stderr } = await execa(ffmpeg, argsCopy, { all: true });
     if (stdout) console.log("FFMPEG OUT:", stdout.slice(-4000));
     if (stderr) console.log("FFMPEG ERR:", stderr.slice(-4000));
-  } catch (err){
-    console.error("❌ FFmpeg error:", err.message);
-    if (err.all) console.error("FFMPEG LOGS:", String(err.all).slice(-8000));
-    throw err;
+  } catch (err) {
+    console.error("⚠️ FFmpeg audio copy failed, retrying with AAC:", err.message);
+    if (err.all) console.error("FFMPEG LOGS (copy):", String(err.all).slice(-8000));
+
+    // 2) fallback til aac (så pipeline ikke knækker)
+    let argsAac = [
+      "-y", "-hide_banner", "-nostdin",
+      "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
+      "-i", inPath,
+      "-vf", vf,
+      "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
+      "-preset", "veryfast", "-crf", "23",
+      "-c:a", "aac", "-b:a", "128k",
+      "-movflags", "+faststart",
+      outPath
+    ];
+    console.log("FFmpeg (dedupe, audio=aac fallback) args:", argsAac.join(" "));
+    const { stdout, stderr } = await execa(ffmpeg, argsAac, { all: true });
+    if (stdout) console.log("FFMPEG OUT (aac):", stdout.slice(-4000));
+    if (stderr) console.log("FFMPEG ERR (aac):", stderr.slice(-4000));
   }
+
   const { size } = await fs.stat(outPath);
   console.log("FFmpeg output bytes:", size);
 }
@@ -223,8 +231,8 @@ app.post("/jobs", async (req, res) => {
     const accounts = {
       tiktok: uniq(p.accounts?.tiktok||[]),
       instagram: uniq(p.accounts?.instagram||[]),
-      youtube: uniq(p.accounts?.youtube||[])
-    };
+      youtube: uniq(p.accounts?.youtube||[])}
+    ;
     const webhookStatusUrl = p.webhook_status_url || null;
     const jobId = "job_" + Math.random().toString(36).slice(2,10);
 
