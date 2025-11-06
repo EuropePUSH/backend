@@ -1,4 +1,4 @@
-// index.js — EuropePush backend (DEDUPER: no text overlay) + low-RAM FFmpeg + Supabase
+// index.js — EuropePush backend (DEDUPER, audio=copy) + low-RAM + single-flight + light mode
 import express from "express";
 import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
@@ -125,66 +125,90 @@ async function writeBase64ToFile(b64, outPath){
   return outPath;
 }
 
-// ---------- FFmpeg (DEDUPER: no text; audio=copy) ----------
-function vfChainDedupe({ jitterSeed = 0 }) {
-  // mikro-ændringer for at bryde perceptual hash uden synlig forskel
-  const px = 2 + (jitterSeed % 5);            // 2..6 px crop fra hver kant
-  const hueDeg = 0.3 + (jitterSeed % 3)*0.1;  // 0.3..0.5 grader hue-shift
-  const noiseStrength = 1;                    // lav film-grain
+// ---------- SINGLE-FLIGHT (1 job ad gangen) ----------
+let processingLock = false;
+async function withSingleFlight(fn) {
+  while (processingLock) { await new Promise(r => setTimeout(r, 400)); }
+  processingLock = true;
+  try { return await fn(); }
+  finally { processingLock = false; }
+}
 
-  return [
+// ---------- FFmpeg (DEDUPER: no text; audio=copy) ----------
+function vfChainDedupe({ jitterSeed = 0, light = false }) {
+  const px = 2 + (jitterSeed % 5); // 2..6 px crop
+  const chain = [
     "scale=w=1080:h=1920:force_original_aspect_ratio=decrease",
     "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2",
     `crop=1080-${px*2}:1920-${px*2}:${px}:${px}`,
     "pad=1080:1920:(1080-iw)/2:(1920-ih)/2",
-    `hue=h=${hueDeg}*PI/180:s=1`,
-    `noise=alls=${noiseStrength}:allf=t`
-  ].join(",");
+  ];
+  if (!light) {
+    const hueDeg = 0.3 + (jitterSeed % 3)*0.1;  // lille hue-shift
+    const noiseStrength = 1;                    // lav film-grain
+    chain.push(`hue=h=${hueDeg}*PI/180:s=1`, `noise=alls=${noiseStrength}:allf=t`);
+  }
+  return chain.join(",");
 }
 
-async function runFfmpeg(inPath, outPath, jobId = "job"){
+async function runFfmpeg(inPath, outPath, jobId = "job", opts = {}) {
   // deterministisk seed ud fra jobId
   let seed = 0;
   for (const ch of String(jobId)) seed = (seed * 31 + ch.charCodeAt(0)) >>> 0;
 
-  const vf = vfChainDedupe({ jitterSeed: seed });
+  const vf = vfChainDedupe({ jitterSeed: seed, light: !!opts.light });
 
-  // 1) forsøg med audio=copy (bevar lyd bit-for-bit → bedst for TikTok sound match)
-  let argsCopy = [
-    "-y", "-hide_banner", "-nostdin",
-    "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
+  // Første forsøg: audio 1:1 (copy) for at bevare lyd fingerprint
+  const argsCopy = [
+    "-y","-hide_banner","-nostdin",
+    "-threads","1","-filter_threads","1","-filter_complex_threads","1",
     "-i", inPath,
     "-vf", vf,
-    "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
-    "-preset", "veryfast", "-crf", "23",
-    "-c:a", "copy",
-    "-movflags", "+faststart",
+    "-c:v","libx264","-profile:v","high","-pix_fmt","yuv420p",
+    "-preset", opts.light ? "ultrafast" : "veryfast",
+    "-crf","23",
+    "-c:a","copy",
+    "-movflags","+faststart",
     outPath
   ];
 
+  // Light mode bitrate cap (store filer → mindre CPU)
+  if (opts.light) {
+    const i = argsCopy.indexOf("-crf");
+    if (i !== -1) {
+      argsCopy.splice(i+2, 0, "-maxrate","2500k","-bufsize","5000k");
+    }
+  }
+
   console.log("FFmpeg (dedupe, audio=copy) args:", argsCopy.join(" "));
   try {
-    const { stdout, stderr } = await execa(ffmpeg, argsCopy, { all: true });
+    const { stdout, stderr } = await execa(ffmpeg, argsCopy, { all: true, timeout: 300000 });
     if (stdout) console.log("FFMPEG OUT:", stdout.slice(-4000));
     if (stderr) console.log("FFMPEG ERR:", stderr.slice(-4000));
   } catch (err) {
-    console.error("⚠️ FFmpeg audio copy failed, retrying with AAC:", err.message);
+    console.error("⚠️ FFmpeg copy failed, retry AAC:", err.message);
     if (err.all) console.error("FFMPEG LOGS (copy):", String(err.all).slice(-8000));
 
-    // 2) fallback til aac (så pipeline ikke knækker)
-    let argsAac = [
-      "-y", "-hide_banner", "-nostdin",
-      "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
+    const argsAac = [
+      "-y","-hide_banner","-nostdin",
+      "-threads","1","-filter_threads","1","-filter_complex_threads","1",
       "-i", inPath,
       "-vf", vf,
-      "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
-      "-preset", "veryfast", "-crf", "23",
-      "-c:a", "aac", "-b:a", "128k",
-      "-movflags", "+faststart",
+      "-c:v","libx264","-profile:v","high","-pix_fmt","yuv420p",
+      "-preset", opts.light ? "ultrafast" : "veryfast",
+      "-crf","23",
+      "-c:a","aac","-b:a","128k",
+      "-movflags","+faststart",
       outPath
     ];
-    console.log("FFmpeg (dedupe, audio=aac fallback) args:", argsAac.join(" "));
-    const { stdout, stderr } = await execa(ffmpeg, argsAac, { all: true });
+    if (opts.light) {
+      const i2 = argsAac.indexOf("-crf");
+      if (i2 !== -1) {
+        argsAac.splice(i2+2, 0, "-maxrate","2500k","-bufsize","5000k");
+      }
+    }
+    console.log("FFmpeg (dedupe, aac fallback) args:", argsAac.join(" "));
+    const { stdout, stderr } = await execa(ffmpeg, argsAac, { all: true, timeout: 300000 });
     if (stdout) console.log("FFMPEG OUT (aac):", stdout.slice(-4000));
     if (stderr) console.log("FFMPEG ERR (aac):", stderr.slice(-4000));
   }
@@ -250,35 +274,41 @@ app.post("/jobs", async (req, res) => {
       await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:35});
     },600);
 
-    // 70% — stream, ffmpeg (dedupe), upload
+    // 70% — stream, ffmpeg (dedupe), upload (single-flight + light mode for big inputs)
     setTimeout(async ()=>{
-      const inPath = path.join(TMP_DIR, `in_${jobId}.mp4`);
-      const outPath = path.join(TMP_DIR, `out_${jobId}.mp4`);
-      try{
-        if (sourceType==="url") await downloadUrlToFile(sourceUrl, inPath);
-        else await writeBase64ToFile(sourceB64, inPath);
-
+      await withSingleFlight(async ()=>{
+        const inPath = path.join(TMP_DIR, `in_${jobId}.mp4`);
+        const outPath = path.join(TMP_DIR, `out_${jobId}.mp4`);
         try{
-          await runFfmpeg(inPath, outPath, jobId);
-        }catch(fferr){
-          console.error("FFmpeg failed — using original file:", fferr.message);
-          await fs.copyFile(inPath, outPath);
+          if (sourceType==="url") await downloadUrlToFile(sourceUrl, inPath);
+          else await writeBase64ToFile(sourceB64, inPath);
+
+          // Light mode ved store filer (>15MB)
+          const { size } = await fs.stat(inPath);
+          const light = size > 15 * 1024 * 1024;
+
+          try{
+            await runFfmpeg(inPath, outPath, jobId, { light });
+          }catch(fferr){
+            console.error("FFmpeg failed — using original file:", fferr.message);
+            await fs.copyFile(inPath, outPath);
+          }
+
+          const url = await uploadFilePathToStorage(jobId, outPath);
+          const out = [{ url, caption: null, hashtags: null }];
+
+          await dbSetOutputs(jobId, out);
+          await dbUpdateState(jobId,"processing",70,{ outputs: out.map(o=>o.url) });
+          await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:70,outputs: out.map(o=>o.url) });
+        }catch(e){
+          console.error("upload pipeline error:", e);
+          await dbUpdateState(jobId,"failed",100,{ error: String(e.message||e) });
+          await notify(webhookStatusUrl,{job_id:jobId,state:"failed",progress:100,error:String(e.message||e)});
+          return;
+        }finally{
+          for (const pth of [inPath, outPath]) { try { await fs.unlink(pth); } catch {} }
         }
-
-        const url = await uploadFilePathToStorage(jobId, outPath);
-        const out = [{ url, caption: null, hashtags: null }];
-
-        await dbSetOutputs(jobId, out);
-        await dbUpdateState(jobId,"processing",70,{ outputs: out.map(o=>o.url) });
-        await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:70,outputs: out.map(o=>o.url) });
-      }catch(e){
-        console.error("upload pipeline error:", e);
-        await dbUpdateState(jobId,"failed",100,{ error: String(e.message||e) });
-        await notify(webhookStatusUrl,{job_id:jobId,state:"failed",progress:100,error:String(e.message||e)});
-        return;
-      }finally{
-        for (const pth of [inPath, outPath]) { try { await fs.unlink(pth); } catch {} }
-      }
+      });
     },1800);
 
     // 100%
