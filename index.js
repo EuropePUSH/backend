@@ -151,50 +151,54 @@ function vfChainNoAudioTouch({ jitterSeed = 0, enableJitter = true }) {
 
 // ---------- FFmpeg runner (video re-encode; audio COPY; fallback = remux only) ----------
 async function runFfmpegVideoOnly(inPath, outPath, seed, light = false) {
-  const vf = vfChainNoAudioTouch({ jitterSeed: seed, enableJitter: VIDEO_JITTER });
+  const LOW_MEM = String(process.env.LOW_MEM || "false").toLowerCase() === "true";
 
-  // Quality-first encoder, conservative to avoid artifacts
+  // Low-mem: brug billigere scaler + endnu lettere encoder
+  const vf = (() => {
+    const px = 2 + (seed % 5);
+    const scaleHQ   = LOW_MEM
+      ? "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=fast_bilinear"
+      : "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int";
+    const padFit    = "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2";
+    const crop      = `crop=1080-${px*2}:1920-${px*2}:${px}:${px}`;
+    const padOut    = "pad=1080:1920:(1080-iw)/2:(1920-ih)/2";
+    const jitter    = (String(process.env.VIDEO_JITTER || "true").toLowerCase() !== "false");
+    const jf        = 0.999 + ((seed % 3) * 0.001);
+    return [scaleHQ, padFit, crop, padOut, ...(jitter ? [`setpts=${jf}*PTS`] : [])].join(",");
+  })();
+
+  // Encoder indstillinger: ultralet for 512MB
   const args = [
     "-y","-hide_banner","-nostdin",
     "-threads","1","-filter_threads","1","-filter_complex_threads","1",
     "-i", inPath,
     "-vf", vf,
-    "-map","0:v:0","-map","0:a:0",   // keep original audio track
+    "-map","0:v:0","-map","0:a:0",
     "-c:v","libx264","-profile:v","high","-pix_fmt","yuv420p",
-    "-preset", light ? "fast" : "medium",
-    "-crf", light ? "20" : "19",
-    "-tune","film",
-    "-x264-params","keyint=180:min-keyint=36:scenecut=0:bframes=3:ref=3:rc-lookahead=20",
-    "-c:a","copy",                    // <-- NO AUDIO TOUCH
+    ...(LOW_MEM ? ["-preset","ultrafast","-crf","22"] : ["-preset", "fast", "-crf", "20"]),
+    "-tune","fastdecode",
+    "-x264-params", LOW_MEM
+      ? "ref=1:bframes=2:rc-lookahead=8:keyint=120:min-keyint=24:scenecut=0"
+      : "ref=3:bframes=3:rc-lookahead=12:keyint=150:min-keyint=30:scenecut=0",
+    ...(LOW_MEM ? ["-maxrate","3000k","-bufsize","6000k"] : ["-maxrate","3500k","-bufsize","7000k"]),
+    "-max_muxing_queue_size","512",
+    "-c:a","copy", // 100% no audio touch
     "-movflags","+faststart",
     outPath
   ];
 
-  // Light-mode mild VBV to protect low RAM instances
-  if (light) {
-    const i = args.indexOf("-crf");
-    if (i !== -1) args.splice(i+2, 0, "-maxrate","4000k","-bufsize","8000k");
-  }
-
-  console.log("FFmpeg (NO-AUDIO, safe) args:", args.join(" "));
+  console.log("FFmpeg args (low-mem aware):", args.join(" "));
   try {
-    const { stdout, stderr } = await execa(ffmpeg, args, { all: true, timeout: 300000 });
-    if (stdout) console.log("FFMPEG OUT:", stdout.slice(-4000));
-    if (stderr) console.log("FFMPEG ERR:", stderr.slice(-4000));
+    const { all } = await execa(ffmpeg, args, { all: true, timeout: 300000 });
+    if (all) console.log("FFMPEG LOGS:", String(all).slice(-6000));
   } catch (err) {
-    console.error("⚠️ FFmpeg video encode failed. Fallback to REMUX (copy streams):", err.message);
-    // Fallback: remux both streams (changes container atoms; still breaks byte-level dupes; audio untouched)
-    const remuxArgs = [
-      "-y","-hide_banner","-nostdin",
-      "-i", inPath,
-      "-c","copy","-movflags","+faststart",
-      outPath
-    ];
+    console.error("⚠️ ENCODE FAIL — fallback remux:", err.message);
+    // Sidste udvej: remux (stadig no-audio-touch, og lav byte-forskel i containeren)
+    const remuxArgs = ["-y","-hide_banner","-nostdin","-i", inPath, "-c","copy","-movflags","+faststart", outPath];
     await execa(ffmpeg, remuxArgs, { all: true, timeout: 120000 });
   }
-
   const { size } = await fs.stat(outPath);
-  console.log("FFmpeg output bytes:", size);
+  console.log("ENCODE_OK bytes:", size);
 }
 
 // ---------- Notify ----------
