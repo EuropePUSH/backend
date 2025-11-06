@@ -1,4 +1,4 @@
-// index.js — low-RAM FFmpeg pipeline (streaming) + Supabase Storage
+// index.js — EuropePush backend (DEDUPER: no text overlay) + low-RAM FFmpeg + Supabase
 import express from "express";
 import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
@@ -11,7 +11,7 @@ import { pipeline } from "stream/promises";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "50mb" })); // allow base64 payloads
+app.use(express.json({ limit: "50mb" }));
 
 // ---------- ENV ----------
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
@@ -91,22 +91,17 @@ async function dbGetJob(job_id){
 // ---------- STORAGE ----------
 async function uploadFilePathToStorage(jobId, filePath){
   const key = `jobs/${jobId}/clip_v1.mp4`;
-
-  // Læs filen til RAM som Buffer (fixer duplex/stream-problemet)
-  const buf = await fs.readFile(filePath);
+  const buf = await fs.readFile(filePath); // buffer upload (stabil på Node 18+)
   console.log("UPLOAD buffer bytes:", buf.length);
-
   const { error: upErr } = await supabase.storage.from("outputs").upload(key, buf, {
     contentType: "video/mp4",
     upsert: true
   });
   if (upErr) throw upErr;
-
   const { data } = supabase.storage.from("outputs").getPublicUrl(key);
   return data.publicUrl;
 }
 
-// Stream download to file (no big Buffer)
 async function downloadUrlToFile(url, outPath){
   const res = await fetch(url);
   if (!res.ok) throw new Error(`download failed: ${res.status}`);
@@ -117,9 +112,8 @@ async function downloadUrlToFile(url, outPath){
   return outPath;
 }
 
-// Write base64 (or data: URL) to file
 async function writeBase64ToFile(b64, outPath){
-  let base64 = b64.trim();
+  let base64 = (b64||"").trim();
   const comma = base64.indexOf(",");
   if (base64.startsWith("data:")) {
     if (comma === -1) throw new Error("invalid data URL");
@@ -131,52 +125,53 @@ async function writeBase64ToFile(b64, outPath){
   return outPath;
 }
 
-// ---------- FFmpeg ----------
-async function pickFontFile(){
-  const cands = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
-  ];
-  for (const pth of cands){
-    try { await fs.access(pth); console.log("🅰️ drawtext font:", pth); return pth; } catch {}
-  }
-  console.log("⚠️ No system font found; skip drawtext.");
-  return null;
-}
+// ---------- FFmpeg (DEDUPER: no text) ----------
+function vfChainDedupe({ jitterSeed = 0 }) {
+  // mikro-ændringer for at bryde perceptual hash uden synlig forskel
+  const px = 2 + (jitterSeed % 5);         // 2..6 px crop fra hver kant
+  const hueDeg = 0.3 + (jitterSeed % 3)*0.1; // 0.3..0.5 grader hue-shift
+  const noiseStrength = 1;                 // lav film-grain
 
-function vfChain({hook,watermark,font}){
-  const chain = [
+  return [
     "scale=w=1080:h=1920:force_original_aspect_ratio=decrease",
-    "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2"
-  ];
-  if (font){
-    const safeHook = (hook||"ICEBERG drop i dag ❄️").replace(/:/g,"\\:").replace(/'/g,"\\'");
-    const safeWM = (watermark||"@europepush").replace(/:/g,"\\:").replace(/'/g,"\\'");
-    chain.push(
-      `drawtext=fontfile='${font}':text='${safeHook}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.35:boxborderw=10:x=(w-text_w)/2:y=120`,
-      `drawtext=fontfile='${font}':text='${safeWM}':fontcolor=white@0.7:fontsize=28:x=40:y=80`
-    );
-  }
-  return chain.join(",");
+    "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2",
+    `crop=1080-${px*2}:1920-${px*2}:${px}:${px}`,
+    "pad=1080:1920:(1080-iw)/2:(1920-ih)/2",
+    `hue=h=${hueDeg}*PI/180:s=1`,
+    `noise=alls=${noiseStrength}:allf=t`
+  ].join(",");
 }
 
-async function runFfmpeg(inPath, outPath, overlays={}){
-  const font = await pickFontFile();
-  const vf = vfChain({ hook: overlays.hook, watermark: overlays.watermark, font });
+async function runFfmpeg(inPath, outPath, jobId = "job"){
+  // deterministisk seed ud fra jobId
+  let seed = 0;
+  for (const ch of String(jobId)) seed = (seed * 31 + ch.charCodeAt(0)) >>> 0;
+
+  const vf = vfChainDedupe({ jitterSeed: seed });
+
+  // lyd: tiny fade in/out + 0.99x tempo (næsten usynligt, bryder audio hash)
+  const af = [
+    "atrim=start=0",
+    "asetpts=N/SR/TB",
+    "afade=t=in:ss=0:d=0.03",
+    "afade=t=out:st=TN-0.03:d=0.03",
+    "atempo=0.99"
+  ].join(",");
+
   const args = [
     "-y", "-hide_banner", "-nostdin",
     "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
     "-i", inPath,
     "-vf", vf,
+    "-af", af,
     "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
     "-preset", "veryfast", "-crf", "23",
     "-c:a", "aac", "-b:a", "128k",
     "-movflags", "+faststart",
     outPath
   ];
-  console.log("FFmpeg args:", args.join(" "));
+
+  console.log("FFmpeg (dedupe) args:", args.join(" "));
   try {
     const { stdout, stderr } = await execa(ffmpeg, args, { all: true });
     if (stdout) console.log("FFMPEG OUT:", stdout.slice(-4000));
@@ -212,7 +207,7 @@ app.get("/health", async (_req,res)=>{
 });
 
 // ---------- Jobs ----------
-app.post("/jobs", async (req,res)=>{
+app.post("/jobs", async (req, res) => {
   try{
     const p = req.body || {};
     const sourceUrl = typeof p.source_video_url==="string" ? p.source_video_url.trim() : "";
@@ -222,7 +217,7 @@ app.post("/jobs", async (req,res)=>{
     else if (sourceB64) sourceType="base64";
     else return res.status(400).json({error:"Provide source_video_url (.mp4) OR source_video_base64"});
 
-    const preset = String(p.preset_id || "default");
+    const preset = String(p.preset_id || "dedupe");
     const variations = clamp(parseInt(p.variations||1,10),1,50);
     const targetPlatforms = uniq(p.target_platforms||[]);
     const accounts = {
@@ -236,7 +231,7 @@ app.post("/jobs", async (req,res)=>{
     await dbCreateJob({
       job_id: jobId, created_at: nowISO(),
       state:"queued", progress:0,
-      input:{ source: sourceType==="url"?sourceUrl:"(base64)", preset, variations, targetPlatforms, accounts }
+      input:{ source: sourceType==="url"?sourceUrl:"(base64)", preset, variations, targetPlatforms, accounts, mode:"dedupe" }
     });
 
     res.status(201).json({ job_id: jobId, state: "queued", progress: 0 });
@@ -247,26 +242,24 @@ app.post("/jobs", async (req,res)=>{
       await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:35});
     },600);
 
-    // 70% — stream to /tmp, FFmpeg, upload, cleanup
+    // 70% — stream, ffmpeg (dedupe), upload
     setTimeout(async ()=>{
       const inPath = path.join(TMP_DIR, `in_${jobId}.mp4`);
       const outPath = path.join(TMP_DIR, `out_${jobId}.mp4`);
       try{
-        if (sourceType==="url") {
-          await downloadUrlToFile(sourceUrl, inPath);
-        } else {
-          await writeBase64ToFile(sourceB64, inPath);
-        }
+        if (sourceType==="url") await downloadUrlToFile(sourceUrl, inPath);
+        else await writeBase64ToFile(sourceB64, inPath);
 
         try{
-          await runFfmpeg(inPath, outPath, { hook:"ICEBERG drop i dag ❄️", watermark:"@europepush" });
+          await runFfmpeg(inPath, outPath, jobId);
         }catch(fferr){
           console.error("FFmpeg failed — using original file:", fferr.message);
           await fs.copyFile(inPath, outPath);
         }
 
         const url = await uploadFilePathToStorage(jobId, outPath);
-        const out = [{ url, caption: "ICEBERG drop ❄️ — Følg for mere", hashtags: ["#europesnus","#iceberg","#fyp"] }];
+        const out = [{ url, caption: null, hashtags: null }];
+
         await dbSetOutputs(jobId, out);
         await dbUpdateState(jobId,"processing",70,{ outputs: out.map(o=>o.url) });
         await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:70,outputs: out.map(o=>o.url) });
@@ -276,10 +269,7 @@ app.post("/jobs", async (req,res)=>{
         await notify(webhookStatusUrl,{job_id:jobId,state:"failed",progress:100,error:String(e.message||e)});
         return;
       }finally{
-        // cleanup temp files
-        for (const pth of [inPath, outPath]) {
-          try { await fs.unlink(pth); } catch {}
-        }
+        for (const pth of [inPath, outPath]) { try { await fs.unlink(pth); } catch {} }
       }
     },1800);
 
@@ -295,7 +285,7 @@ app.post("/jobs", async (req,res)=>{
   }
 });
 
-// GET /jobs/:job_id
+// ---------- Status ----------
 app.get("/jobs/:job_id", async (req,res)=>{
   try{
     const job = await dbGetJob(req.params.job_id);
@@ -307,7 +297,6 @@ app.get("/jobs/:job_id", async (req,res)=>{
   }
 });
 
-// GET /jobs?id=<job_id>
 app.get("/jobs", async (req,res)=>{
   const id = req.query.id || req.query.job_id;
   if (!id) return res.status(400).json({ error:"missing job_id" });
