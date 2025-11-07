@@ -1,357 +1,356 @@
-// index.js — EuropePush backend (NO-AUDIO-TOUCH, SAFE anti-duplicate, 1 output/account)
+// index.js (ESM)
 import express from "express";
 import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
-import ffmpeg from "ffmpeg-static";
-import { execa } from "execa";
+import crypto from "crypto";
 import fs from "fs/promises";
 import fss from "fs";
 import path from "path";
-import { pipeline } from "stream/promises";
+import os from "os";
+import { fileURLToPath } from "url";
+import ffmpegBin from "ffmpeg-static";
+import { execa } from "execa";
 
+// ---------- Config ----------
+const PORT = Number(process.env.PORT || 10000);
+const API_KEY = process.env.API_KEY || "";
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
+const VIDEO_JITTER = (process.env.VIDEO_JITTER || "").toLowerCase() === "true";
+
+const TT_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY || "";
+const TT_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || "";
+const TT_REDIRECT = process.env.TIKTOK_REDIRECT_URL || "";
+const TIKTOK_SCOPES = ""; // hold den tom til ansøgning, kan udvides senere
+
+// ---------- Init ----------
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(express.json({ limit: "4mb" }));
 
-// ---------- ENV ----------
-const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
-const SUPABASE_SERVICE_KEY = (process.env.SUPABASE_SERVICE_KEY || "").trim();
-const API_KEY = (process.env.API_KEY || "").trim();
-const VIDEO_JITTER = String(process.env.VIDEO_JITTER || "true").toLowerCase() !== "false";
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  console.warn("⚠️ SUPABASE_URL / SUPABASE_SERVICE_KEY mangler.");
+}
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-console.log("🔧 ENV SUPABASE_URL:", SUPABASE_URL ? "present" : "MISSING");
-console.log("🔧 ENV SUPABASE_SERVICE_KEY:", SUPABASE_SERVICE_KEY ? "present" : "MISSING");
-console.log("🔧 ENV API_KEY:", API_KEY ? "present" : "MISSING");
-console.log("🔧 ENV VIDEO_JITTER:", VIDEO_JITTER);
+// ---------- Utils ----------
+const tmpFile = (prefix, ext = ".mp4") =>
+  path.join(os.tmpdir(), `${prefix}_${crypto.randomBytes(6).toString("hex")}${ext}`);
 
-const supabase = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
-  : null;
-
-const TMP_DIR = "/tmp";
-const nowISO = () => new Date().toISOString();
-const uniq = (arr)=>[...new Set(arr||[])];
-
-// ---------- AUTH ----------
-app.use((req,res,next)=>{
-  if (req.method==="POST" && (req.path==="/jobs"||req.path==="/jobs/")){
-    const k=(req.headers["x-api-key"]??"").toString().trim();
-    if (!API_KEY || k!==API_KEY){
-      console.log("AUTH DEBUG:",{env_len:API_KEY.length,header_len:k.length});
-      return res.status(401).json({error:"unauthorized"});
-    }
+async function downloadToFile(url) {
+  const inPath = tmpFile("in_job");
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    throw new Error(`Download failed: ${resp.status} ${await resp.text()}`);
   }
-  next();
-});
-
-// ---------- DB ----------
-async function dbCreateJob(job){
-  const { error } = await supabase.from("jobs").insert({
-    job_id: job.job_id, state: job.state, progress: job.progress, input: job.input
-  });
-  if (error) throw error;
-  const { error: e2 } = await supabase.from("job_events").insert({
-    job_id: job.job_id, state:"queued", progress:0, payload:{created_at:job.created_at}
-  });
-  if (e2) throw e2;
-}
-async function dbUpdateState(job_id,state,progress,payload=null){
-  const { error } = await supabase.from("jobs").update({state,progress}).eq("job_id",job_id);
-  if (error) throw error;
-  const { error: e2 } = await supabase.from("job_events").insert({job_id,state,progress,payload});
-  if (e2) throw e2;
-}
-async function dbSetOutputs(job_id, outputs){
-  await supabase.from("job_outputs").delete().eq("job_id", job_id);
-  const rows = outputs.map((o,i)=>({ job_id, idx:i+1, url:o.url, caption:o.caption||null, hashtags:o.hashtags||null }));
-  const { error } = await supabase.from("job_outputs").insert(rows);
-  if (error) throw error;
-}
-async function dbGetJob(job_id){
-  const { data: job, error } = await supabase.from("jobs").select("*").eq("job_id",job_id).maybeSingle();
-  if (error) throw error;
-  if (!job) return null;
-  const [{data:outs},{data:evs}] = await Promise.all([
-    supabase.from("job_outputs").select("*").eq("job_id",job_id).order("idx",{ascending:true}),
-    supabase.from("job_events").select("*").eq("job_id",job_id).order("id",{ascending:true}),
-  ]);
-  return {
-    job_id,
-    created_at: job.created_at,
-    state: job.state,
-    progress: job.progress,
-    input: job.input || {},
-    outputs: (outs||[]).map(o=>({id:o.idx,url:o.url,caption:o.caption,hashtags:o.hashtags})),
-    events: (evs||[]).map(e=>({at:e.at,state:e.state,progress:e.progress,payload:e.payload}))
-  };
+  const ab = await resp.arrayBuffer();
+  const buf = Buffer.from(ab);
+  await fs.writeFile(inPath, buf);
+  console.log("Downloaded to file bytes:", buf.length);
+  return inPath;
 }
 
-// ---------- STORAGE ----------
-async function uploadBufferToStorage(key, buf){
-  console.log("UPLOAD buffer bytes:", buf.length);
-  const { error: upErr } = await supabase.storage.from("outputs").upload(key, buf, {
-    contentType: "video/mp4",
-    upsert: true
-  });
-  if (upErr) throw upErr;
-  const { data } = supabase.storage.from("outputs").getPublicUrl(key);
-  return data.publicUrl;
-}
-async function uploadFilePathToStorage(key, filePath){
-  const buf = await fs.readFile(filePath);
-  return uploadBufferToStorage(key, buf);
+function jitterVal(base) {
+  if (!VIDEO_JITTER) return base;
+  // ±0.6% variation
+  const f = 1 + (Math.random() * 1.2 - 0.6) / 100;
+  return Math.max(0.5, base * f);
 }
 
-async function downloadUrlToFile(url, outPath){
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`download failed: ${res.status}`);
-  const ws = fss.createWriteStream(outPath);
-  await pipeline(res.body, ws);
-  const { size } = await fs.stat(outPath);
-  console.log("Downloaded to file bytes:", size);
-  return outPath;
-}
-async function writeBase64ToFile(b64, outPath){
-  let base64 = (b64||"").trim();
-  const comma = base64.indexOf(",");
-  if (base64.startsWith("data:")) {
-    if (comma === -1) throw new Error("invalid data URL");
-    base64 = base64.slice(comma+1);
-  }
-  const buf = Buffer.from(base64, "base64");
-  console.log("BASE64 decoded bytes:", buf.length);
-  await fs.writeFile(outPath, buf);
-  return outPath;
-}
+async function ffmpegTransform(inPath, outPath) {
+  // Low-mem safe: én tråd + simple filtre, behold audio uændret
+  const vf = [
+    "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int",
+    "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2",
+    "crop=1080-4:1920-4:2:2",
+    "pad=1080:1920:(1080-iw)/2:(1920-ih)/2",
+    // en meget svag farve-jitter for at undgå perfekt bit-match
+    "hue=h=0.4*PI/180:s=1"
+  ].join(",");
 
-// ---------- SINGLE-FLIGHT ----------
-let processingLock = false;
-async function withSingleFlight(fn) {
-  while (processingLock) { await new Promise(r => setTimeout(r, 400)); }
-  processingLock = true;
-  try { return await fn(); }
-  finally { processingLock = false; }
-}
+  const x264 = [
+    "ref=3",
+    "bframes=3",
+    `rc-lookahead=${Math.round(jitterVal(12))}`,
+    `keyint=${Math.round(jitterVal(150))}`,
+    `min-keyint=${Math.round(jitterVal(30))}`,
+    "scenecut=0"
+  ].join(":");
 
-// ---------- VF chain (HQ scale + micro-crop/pad; optional video-only setpts jitter) ----------
-function vfChainNoAudioTouch({ jitterSeed = 0, enableJitter = true }) {
-  const px = 2 + (jitterSeed % 5); // 2..6 px micro-crop
-  const scaleHQ = "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int";
-  const padFit = "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2";
-  const crop   = `crop=1080-${px*2}:1920-${px*2}:${px}:${px}`;
-  const padOut = "pad=1080:1920:(1080-iw)/2:(1920-ih)/2";
-
-  // tiny video-only timing nudge (breaks frame/GOP hash, invisible to eye)
-  // 0.999–1.001 variation
-  const jitterFactor = 0.999 + ((jitterSeed % 3) * 0.001);
-  const setpts = `setpts=${jitterFactor}*PTS`;
-
-  return [scaleHQ, padFit, crop, padOut, ...(enableJitter ? [setpts] : [])].join(",");
-}
-
-// ---------- FFmpeg runner (video re-encode; audio COPY; fallback = remux only) ----------
-async function runFfmpegVideoOnly(inPath, outPath, seed, light = false) {
-  const LOW_MEM = String(process.env.LOW_MEM || "false").toLowerCase() === "true";
-
-  // Low-mem: brug billigere scaler + endnu lettere encoder
-  const vf = (() => {
-    const px = 2 + (seed % 5);
-    const scaleHQ   = LOW_MEM
-      ? "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=fast_bilinear"
-      : "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int";
-    const padFit    = "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2";
-    const crop      = `crop=1080-${px*2}:1920-${px*2}:${px}:${px}`;
-    const padOut    = "pad=1080:1920:(1080-iw)/2:(1920-ih)/2";
-    const jitter    = (String(process.env.VIDEO_JITTER || "true").toLowerCase() !== "false");
-    const jf        = 0.999 + ((seed % 3) * 0.001);
-    return [scaleHQ, padFit, crop, padOut, ...(jitter ? [`setpts=${jf}*PTS`] : [])].join(",");
-  })();
-
-  // Encoder indstillinger: ultralet for 512MB
   const args = [
-    "-y","-hide_banner","-nostdin",
-    "-threads","1","-filter_threads","1","-filter_complex_threads","1",
+    "-y",
+    "-hide_banner",
+    "-nostdin",
+    "-threads", "1",
+    "-filter_threads", "1",
+    "-filter_complex_threads", "1",
     "-i", inPath,
     "-vf", vf,
-    "-map","0:v:0","-map","0:a:0",
-    "-c:v","libx264","-profile:v","high","-pix_fmt","yuv420p",
-    ...(LOW_MEM ? ["-preset","ultrafast","-crf","22"] : ["-preset", "fast", "-crf", "20"]),
-    "-tune","fastdecode",
-    "-x264-params", LOW_MEM
-      ? "ref=1:bframes=2:rc-lookahead=8:keyint=120:min-keyint=24:scenecut=0"
-      : "ref=3:bframes=3:rc-lookahead=12:keyint=150:min-keyint=30:scenecut=0",
-    ...(LOW_MEM ? ["-maxrate","3000k","-bufsize","6000k"] : ["-maxrate","3500k","-bufsize","7000k"]),
-    "-max_muxing_queue_size","512",
-    "-c:a","copy", // 100% no audio touch
-    "-movflags","+faststart",
+    "-map", "0:v:0",
+    "-map", "0:a:0",
+    "-c:v", "libx264",
+    "-profile:v", "high",
+    "-pix_fmt", "yuv420p",
+    "-preset", "fast",
+    "-crf", `${Math.round(jitterVal(20))}`,
+    "-tune", "fastdecode",
+    "-x264-params", x264,
+    "-maxrate", "3500k",
+    "-bufsize", "7000k",
+    "-max_muxing_queue_size", "512",
+    "-c:a", "copy",
+    "-movflags", "+faststart",
     outPath
   ];
 
   console.log("FFmpeg args (low-mem aware):", args.join(" "));
   try {
-    const { all } = await execa(ffmpeg, args, { all: true, timeout: 300000 });
-    if (all) console.log("FFMPEG LOGS:", String(all).slice(-6000));
+    const { stdout, stderr } = await execa(ffmpegBin, args, { timeout: 5 * 60_000 });
+    // valgfrit: console.log(stdout);
+    // valgfrit: console.log(stderr);
   } catch (err) {
-    console.error("⚠️ ENCODE FAIL — fallback remux:", err.message);
-    // Sidste udvej: remux (stadig no-audio-touch, og lav byte-forskel i containeren)
-    const remuxArgs = ["-y","-hide_banner","-nostdin","-i", inPath, "-c","copy","-movflags","+faststart", outPath];
-    await execa(ffmpeg, remuxArgs, { all: true, timeout: 120000 });
+    console.error("FFmpeg failed — using original file:", err?.message || err);
+    // Hvis ffmpeg crasher, lad os falde tilbage til inputfil (kopiér)
+    await fs.copyFile(inPath, outPath);
   }
-  const { size } = await fs.stat(outPath);
-  console.log("ENCODE_OK bytes:", size);
 }
 
-// ---------- Notify ----------
-async function notify(url, body){
-  try{
-    if (!url || !/^https?:\/\//i.test(url)) return;
-    const res = await fetch(url,{ method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body) });
-    if (!res.ok) console.log("⚠️ webhook non-200:", res.status);
-  }catch(e){ console.log("⚠️ webhook notify failed:", e.message); }
+async function uploadFileBufferToStorage(jobId, filePath, filename) {
+  const key = `jobs/${jobId}/${filename}`;
+  const buf = await fs.readFile(filePath);
+  console.log("UPLOAD buffer bytes:", buf.length);
+  const { error: upErr } = await supabase
+    .storage
+    .from("outputs")
+    .upload(key, buf, { contentType: "video/mp4", upsert: true });
+  if (upErr) throw upErr;
+  const { data } = supabase.storage.from("outputs").getPublicUrl(key);
+  return data.publicUrl;
+}
+
+async function notifyWebhook(url, payload) {
+  if (!url) return;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+  } catch (e) {
+    console.warn("webhook notify failed:", e?.message || e);
+  }
 }
 
 // ---------- Health ----------
-app.get("/", (_req,res)=>res.json({status:"API running"}));
-app.get("/health", async (_req,res)=>{
-  try{
-    const { error } = await supabase.from("jobs").select("count",{count:"exact",head:true});
-    if (error) throw error;
-    res.json({ up:true, db:true });
-  }catch{
-    res.status(500).json({ up:true, db:false });
-  }
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    env: {
+      SUPABASE_URL: !!SUPABASE_URL,
+      SUPABASE_SERVICE_KEY: !!SUPABASE_SERVICE_KEY,
+      API_KEY: !!API_KEY
+    }
+  });
 });
 
-// ---------- Jobs (1 output pr. valgt account) ----------
+// ---------- API-key middleware (kun på POST /jobs) ----------
+app.use((req, res, next) => {
+  if (req.method === "POST" && req.path === "/jobs") {
+    const key = req.headers["x-api-key"];
+    if (!key || key !== API_KEY) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+  }
+  next();
+});
+
+// ---------- Opret job ----------
 app.post("/jobs", async (req, res) => {
-  try{
-    const p = req.body || {};
-    const sourceUrl = typeof p.source_video_url==="string" ? p.source_video_url.trim() : "";
-    const sourceB64 = typeof p.source_video_base64==="string" ? p.source_video_base64 : "";
-    let sourceType=null;
-    if (sourceUrl && sourceUrl.toLowerCase().endsWith(".mp4")) sourceType="url";
-    else if (sourceB64) sourceType="base64";
-    else return res.status(400).json({error:"Provide source_video_url (.mp4) OR source_video_base64"});
+  const {
+    source_video_url,
+    preset_id = "Meme Cut",
+    variations = 1,
+    target_platforms = ["tiktok"],
+    accounts = {},
+    webhook_status_url = null
+  } = req.body || {};
 
-    const accounts = {
-      tiktok: uniq(p.accounts?.tiktok||[]),
-      instagram: uniq(p.accounts?.instagram||[]),
-      youtube: uniq(p.accounts?.youtube||[])
-    };
-    const targets = [
-      ...accounts.tiktok.map(a=>({ platform:"tiktok", account:a })),
-      ...accounts.instagram.map(a=>({ platform:"instagram", account:a })),
-      ...accounts.youtube.map(a=>({ platform:"youtube", account:a })),
-    ];
-    const preset = String(p.preset_id || "no-audio-touch");
-    const webhookStatusUrl = p.webhook_status_url || null;
-    const jobId = "job_" + Math.random().toString(36).slice(2,10);
+  if (!source_video_url || typeof source_video_url !== "string") {
+    return res.status(400).json({ error: "source_video_url required" });
+  }
 
-    await dbCreateJob({
-      job_id: jobId, created_at: nowISO(),
-      state:"queued", progress:0,
-      input:{
-        source: sourceType==="url"?sourceUrl:"(base64)",
-        preset,
-        accounts,
-        targets_count: targets.length || 1,
-        mode:"no-audio-touch",
-        jitter: VIDEO_JITTER
-      }
+  const job_id = `job_${crypto.randomBytes(4).toString("hex")}`;
+
+  try {
+    // 1) Insert job starter
+    await supabase.from("jobs").insert({
+      job_id,
+      state: "queued",
+      progress: 0,
+      input: req.body
     });
 
-    res.status(201).json({ job_id: jobId, state: "queued", progress: 0 });
+    // 2) Download
+    await supabase.from("job_events").insert({
+      job_id, state: "downloading", progress: 5, payload: { url: source_video_url }
+    });
+    const inPath = await downloadToFile(source_video_url);
 
-    // 35%
-    setTimeout(async ()=>{
-      await dbUpdateState(jobId,"processing",35);
-      await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:35});
-    },600);
+    // 3) FFmpeg (low-mem safe)
+    await supabase.from("job_events").insert({
+      job_id, state: "processing", progress: 30, payload: { preset_id }
+    });
+    const outName = `clip_${Date.now()}.mp4`;
+    const outPath = tmpFile("out_job");
+    await ffmpegTransform(inPath, outPath);
 
-    // 70% — download, ffmpeg per account, upload (single-flight)
-    setTimeout(async ()=>{
-      await withSingleFlight(async ()=>{
-        const inPath = path.join(TMP_DIR, `in_${jobId}.mp4`);
-        try{
-          if (sourceType==="url") await downloadUrlToFile(sourceUrl, inPath);
-          else await writeBase64ToFile(sourceB64, inPath);
+    // 4) Upload til Supabase Storage
+    await supabase.from("job_events").insert({
+      job_id, state: "uploading", progress: 80
+    });
+    const publicUrl = await uploadFileBufferToStorage(job_id, outPath, outName);
 
-          const { size } = await fs.stat(inPath);
-          const light = size > 25 * 1024 * 1024; // big inputs → lighter preset/CRF
+    // 5) Gem output
+    await supabase.from("job_outputs").insert({
+      job_id, idx: 0, url: publicUrl, caption: null, hashtags: null
+    });
 
-          const targetsEff = (targets.length>0) ? targets : [{ platform:"generic", account:"default" }];
-          const outputs = [];
+    // 6) Done
+    await supabase.from("jobs").update({ state: "completed", progress: 100 }).eq("job_id", job_id);
+    await supabase.from("job_events").insert({ job_id, state: "completed", progress: 100 });
 
-          for (const t of targetsEff){
-            // deterministic seed per platform/account
-            const seedStr = `${jobId}_${t.platform}_${t.account}`;
-            let seed = 0; for (const ch of seedStr) seed = (seed * 31 + ch.charCodeAt(0)) >>> 0;
+    // Webhook (valgfrit)
+    await notifyWebhook(webhook_status_url, { job_id, state: "completed", url: publicUrl });
 
-            const outPath = path.join(TMP_DIR, `out_${jobId}_${t.platform}_${t.account}.mp4`);
-            try{
-              await runFfmpegVideoOnly(inPath, outPath, seed, light);
-            }catch(fferr){
-              console.error(`FFmpeg failed for ${t.platform}/${t.account} — final fallback remux:`, fferr.message);
-              // last resort already done in runner; ensure file exists
-              try { await fs.access(outPath); } catch { await fs.copyFile(inPath, outPath); }
-            }
+    // Ryd tmp
+    try { await fs.unlink(inPath); } catch {}
+    try { await fs.unlink(outPath); } catch {}
 
-            const key = `jobs/${jobId}/clip_${t.platform}_${t.account}.mp4`;
-            const url = await uploadFilePathToStorage(key, outPath);
-            outputs.push({ url, caption: null, hashtags: null });
-            try { await fs.unlink(outPath); } catch {}
-          }
+    return res.json({ job_id, state: "queued", progress: 0 });
+  } catch (e) {
+    console.error("job error:", e);
+    await supabase.from("jobs").update({ state: "failed", progress: 100 }).eq("job_id", job_id);
+    await supabase.from("job_events").insert({
+      job_id, state: "failed", progress: 100, payload: { message: e?.message || String(e) }
+    });
+    await notifyWebhook(req.body?.webhook_status_url, { job_id, state: "failed" });
+    return res.status(500).json({ error: "job failed", job_id });
+  }
+});
 
-          await dbSetOutputs(jobId, outputs);
-          await dbUpdateState(jobId,"processing",70,{ outputs: outputs.map(o=>o.url) });
-          await notify(webhookStatusUrl,{job_id:jobId,state:"processing",progress:70,outputs: outputs.map(o=>o.url) });
-        }catch(e){
-          console.error("upload pipeline error:", e);
-          await dbUpdateState(jobId,"failed",100,{ error: String(e.message||e) });
-          await notify(webhookStatusUrl,{job_id:jobId,state:"failed",progress:100,error:String(e.message||e)});
-          return;
-        }finally{
-          try { await fs.unlink(inPath); } catch {}
+// ---------- GET job ----------
+app.get("/jobs/:id", async (req, res) => {
+  const job_id = req.params.id;
+  const { data: jobs, error: jerr } = await supabase.from("jobs").select("*").eq("job_id", job_id).maybeSingle();
+  if (jerr || !jobs) return res.status(404).json({ error: "not found" });
+  const { data: events } = await supabase.from("job_events").select("*").eq("job_id", job_id).order("id", { ascending: true });
+  const { data: outputs } = await supabase.from("job_outputs").select("*").eq("job_id", job_id).order("idx", { ascending: true });
+  res.json({ job: jobs, events, outputs });
+});
+
+// ============================================================
+// =============== TikTok OAuth (Login + Callback) ============
+// ============================================================
+const TT_AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/";
+const TT_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/";
+const TT_USERINFO_URL = "https://open.tiktokapis.com/v2/user/info/";
+
+function formBody(obj) {
+  return Object.entries(obj).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
+}
+
+// Start login
+app.get("/auth/tiktok/login", (req, res) => {
+  try {
+    if (!TT_CLIENT_KEY || !TT_CLIENT_SECRET || !TT_REDIRECT) {
+      return res.status(500).send("TikTok OAuth env mangler.");
+    }
+    const state = crypto.randomBytes(12).toString("hex");
+    const url = new URL(TT_AUTH_URL);
+    url.searchParams.set("client_key", TT_CLIENT_KEY);
+    url.searchParams.set("redirect_uri", TT_REDIRECT);
+    url.searchParams.set("response_type", "code");
+    if (TIKTOK_SCOPES) url.searchParams.set("scope", TIKTOK_SCOPES);
+    url.searchParams.set("state", state);
+    return res.redirect(url.toString());
+  } catch (e) {
+    console.error("TT login redirect error:", e);
+    return res.status(500).send("Login init failed");
+  }
+});
+
+// Callback
+app.get("/auth/tiktok/callback", async (req, res) => {
+  try {
+    const { code, error, error_description } = req.query;
+    if (error) return res.status(400).send(`TikTok error: ${error} ${error_description || ""}`);
+    if (!code) return res.status(400).send("Missing code");
+
+    const tokenResp = await fetch(TT_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: formBody({
+        client_key: TT_CLIENT_KEY,
+        client_secret: TT_CLIENT_SECRET,
+        code: code.toString(),
+        grant_type: "authorization_code",
+        redirect_uri: TT_REDIRECT
+      })
+    });
+    if (!tokenResp.ok) {
+      const t = await tokenResp.text();
+      console.error("Token exchange failed:", tokenResp.status, t);
+      return res.status(400).send("Token exchange failed");
+    }
+    const tokenJson = await tokenResp.json();
+    const payload = tokenJson.data ?? tokenJson;
+    const access_token = payload.access_token;
+    const refresh_token = payload.refresh_token || null;
+    let open_id = payload.open_id || null;
+    const expires_in = Number(payload.expires_in || 0);
+
+    if (!access_token) {
+      console.error("No access_token in TikTok response:", tokenJson);
+      return res.status(400).send("No access_token in response");
+    }
+
+    // Prøv at hente open_id hvis ikke givet
+    if (!open_id) {
+      try {
+        const uiResp = await fetch(TT_USERINFO_URL, { headers: { Authorization: `Bearer ${access_token}` } });
+        if (uiResp.ok) {
+          const ui = await uiResp.json();
+          open_id = ui?.data?.user?.open_id || ui?.open_id || null;
         }
-      });
-    },1800);
+      } catch {}
+    }
 
-    // 100%
-    setTimeout(async ()=>{
-      await dbUpdateState(jobId,"complete",100);
-      await notify(webhookStatusUrl,{job_id:jobId,state:"complete",progress:100});
-    },3000);
+    const expiresAt = expires_in ? new Date(Date.now() + expires_in * 1000).toISOString() : null;
+    const { error: dberr } = await supabase.from("tiktok_accounts").insert({
+      tiktok_open_id: open_id,
+      access_token,
+      refresh_token,
+      expires_at: expiresAt
+    });
+    if (dberr) {
+      console.error("Supabase insert error:", dberr);
+      return res.status(500).send("Saved token failed");
+    }
 
-  }catch(err){
-    console.error("❌ POST /jobs error:", err);
-    res.status(500).json({ error:"internal_error" });
+    return res.status(200).send(`
+      <html><body style="font-family: system-ui; padding:24px">
+        <h2>✅ TikTok konto forbundet</h2>
+        <p>open_id: <code>${open_id || "ukendt"}</code></p>
+        <p>Du kan lukke dette vindue.</p>
+      </body></html>
+    `);
+  } catch (e) {
+    console.error("TT callback error:", e);
+    return res.status(500).send("Callback failed");
   }
 });
 
-// ---------- Status ----------
-app.get("/jobs/:job_id", async (req,res)=>{
-  try{
-    const job = await dbGetJob(req.params.job_id);
-    if (!job) return res.status(404).json({ error:"job not found" });
-    res.json(job);
-  }catch(err){
-    console.error("❌ GET /jobs/:id error:", err);
-    res.status(500).json({ error:"internal_error" });
-  }
+// ---------- Start ----------
+app.listen(PORT, () => {
+  console.log("✅ Server on", PORT);
 });
-app.get("/jobs", async (req,res)=>{
-  const id = req.query.id || req.query.job_id;
-  if (!id) return res.status(400).json({ error:"missing job_id" });
-  try{
-    const job = await dbGetJob(String(id));
-    if (!job) return res.status(404).json({ error:"job not found" });
-    res.json(job);
-  }catch(err){
-    console.error("❌ GET /jobs (query) error:", err);
-    res.status(500).json({ error:"internal_error" });
-  }
-});
-
-// ---------- START ----------
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, ()=>console.log(`✅ Server on ${PORT}`));
