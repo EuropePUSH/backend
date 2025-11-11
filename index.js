@@ -29,8 +29,10 @@ app.use(cors());
 app.use(express.json({ limit: "100mb" }));
 app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 
-//------ Tiktok url verifikation --------------
-app.use(express.static("./"));
+// --- TikTok URL verification ---
+app.get("/tiktokCyf5rIYx6ICSKpiqIGzMRNbWc7m4SPoW.txt", (req, res) => {
+  res.type("text/plain").send("tiktok-developers-site-verification=Cyf5rIYx6ICSKpiqIGzMRNbWc7m4SPoW");
+});
 
 // ----------------- SUPABASE -----------------
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
