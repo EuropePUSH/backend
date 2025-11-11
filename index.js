@@ -21,6 +21,19 @@ const TT_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY || "";
 const TT_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || "";
 const TT_REDIRECT = process.env.TIKTOK_REDIRECT_URL || "";
 
+app.get("/auth/tiktok/debug", (req, res) => {
+  const key = process.env.TIKTOK_CLIENT_KEY || "";
+  const secret = process.env.TIKTOK_CLIENT_SECRET || "";
+  res.json({
+    client_key_present: !!key,
+    client_key_len: key.length,
+    client_secret_present: !!secret,
+    client_secret_len: secret.length,
+    redirect_uri: "https://backend-ipt2.onrender.com/auth/tiktok/callback"
+  });
+});
+
+
 // ----------------- APP -----------------
 const app = express();
 app.use(cors({
