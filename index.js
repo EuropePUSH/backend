@@ -10,25 +10,24 @@ import { createClient } from "@supabase/supabase-js";
 import ffmpegBin from "ffmpeg-static";
 import { execa } from "execa";
 
-// ----------------- ENV -----------------
-const PORT = Number(process.env.PORT || 10000);
-const API_KEY = process.env.API_KEY || "";
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
-const VIDEO_JITTER = (process.env.VIDEO_JITTER || "").toLowerCase() === "true";
-
-const TT_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY || "";
-const TT_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || "";
-const TT_REDIRECT =
-  process.env.TIKTOK_REDIRECT_URL ||
-  "https://backend-ipt2.onrender.com/auth/tiktok/callback";
-
-// ----------------- APP INIT -----------------
+// ----------------- INIT -----------------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ----------------- SUPABASE INIT -----------------
+// ----------------- ENV -----------------
+const PORT = Number(process.env.PORT || 10000);
+const API_KEY = (process.env.API_KEY || "").trim();
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
+const SUPABASE_SERVICE_KEY = (process.env.SUPABASE_SERVICE_KEY || "").trim();
+const VIDEO_JITTER = (process.env.VIDEO_JITTER || "").toLowerCase() === "true";
+
+const TT_CLIENT_KEY = (process.env.TIKTOK_CLIENT_KEY || "").trim();
+const TT_CLIENT_SECRET = (process.env.TIKTOK_CLIENT_SECRET || "").trim();
+const TT_REDIRECT =
+  (process.env.TIKTOK_REDIRECT_URL || "https://backend-ipt2.onrender.com/auth/tiktok/callback").trim();
+
+// ----------------- SUPABASE -----------------
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // ----------------- UTILS -----------------
@@ -37,19 +36,31 @@ function genId(prefix = "job") {
 }
 
 // ----------------- HEALTH -----------------
-app.get("/health", (req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
-});
+app.get("/health", (req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
-// ----------------- TIKTOK AUTH -----------------
+// ----------------- TIKTOK OAUTH DEBUG -----------------
 app.get("/auth/tiktok/debug", (req, res) => {
   res.json({
     client_key_present: !!TT_CLIENT_KEY,
     client_key_len: TT_CLIENT_KEY.length,
+    client_key_preview: TT_CLIENT_KEY ? `${TT_CLIENT_KEY.slice(0,4)}…${TT_CLIENT_KEY.slice(-4)}` : null,
     client_secret_present: !!TT_CLIENT_SECRET,
     client_secret_len: TT_CLIENT_SECRET.length,
-    redirect_uri: TT_REDIRECT,
+    client_secret_preview: TT_CLIENT_SECRET ? `${TT_CLIENT_SECRET.slice(0,4)}…${TT_CLIENT_SECRET.slice(-4)}` : null,
+    redirect_uri: TT_REDIRECT
   });
+});
+
+app.get("/auth/tiktok/url", (req, res) => {
+  if (!TT_CLIENT_KEY) return res.status(500).send("Missing TIKTOK_CLIENT_KEY");
+  const url =
+    "https://www.tiktok.com/v2/auth/authorize/?" +
+    `client_key=${encodeURIComponent(TT_CLIENT_KEY)}` +
+    `&scope=${encodeURIComponent("user.info.basic,video.upload,video.publish")}` +
+    `&response_type=code` +
+    `&redirect_uri=${encodeURIComponent(TT_REDIRECT)}` +
+    `&state=${encodeURIComponent("state_epush_123")}`;
+  res.json({ authorize_url: url });
 });
 
 app.get("/auth/tiktok/login", (req, res) => {
@@ -65,8 +76,11 @@ app.get("/auth/tiktok/login", (req, res) => {
 });
 
 app.get("/auth/tiktok/callback", async (req, res) => {
-  const { code, state, error } = req.query;
-  if (error) return res.status(400).send(`TikTok error: ${error}`);
+  const { code, state, error, error_description } = req.query;
+  if (error)
+    return res
+      .status(400)
+      .send(`TikTok error: ${error} ${error_description ? `— ${error_description}` : ""}`);
   if (!code) return res.status(400).send("Missing code – start via /auth/tiktok/login.");
   res.send(`✅ Modtog TikTok auth code: ${String(code).slice(0, 6)}...`);
 });
