@@ -108,6 +108,24 @@ app.get("/auth/tiktok/callback", async (req, res) => {
   }
 });
 
+// ---- ALT authorize base (fallback) ----
+function tiktokAuthorizeUrlAlt() {
+  const params = new URLSearchParams({
+    client_key: TT_CLIENT_KEY,
+    scope: "user.info.basic",           // hold den minimal til login-test
+    response_type: "code",
+    redirect_uri: TT_REDIRECT,
+    state: "state_epush_123",
+  });
+  // Alternativ host (nogle setups kræver denne)
+  return `https://open.tiktokapis.com/v2/oauth/authorize/?${params.toString()}`;
+}
+
+// Ekstra route der bruger alternativ host:
+app.get("/auth/tiktok/start2", (req, res) => {
+  res.redirect(tiktokAuthorizeUrlAlt());
+});
+
 // ----------------- JOBS ENDPOINT -----------------
 app.post("/jobs", async (req, res) => {
   try {
