@@ -1,48 +1,59 @@
-// index.js (ESM) — EuropePUSH backend (OAuth TikTok Sandbox compatible)
+// index.js (ESM) — EuropePUSH backend (TikTok OAuth + robust CORS)
 
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch"; // npm i node-fetch@3
+import fetch from "node-fetch";
 import crypto from "crypto";
 
-// ----------------- ENV -----------------
 const PORT = Number(process.env.PORT || 10000);
-
-// Din offentlige base-URL (brug samme domæne overalt!)
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://api.europepush.com";
-
-// TikTok (S A N D B O X) nøgler
 const TT_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY || "";
 const TT_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || "";
-
-// Redirect skal være IDENTISK her og i TikTok Developer Portal (Sandbox → Login Kit)
 const TT_REDIRECT = `${PUBLIC_BASE_URL}/auth/tiktok/callback`;
 
-// Tillad simple test-UI’er (Base44 m.m.)
+// Optional: limit who can call (comma-separated list). If empty -> reflect any origin.
+const CORS_WHITELIST = (process.env.CORS_WHITELIST || "").split(",").map(s => s.trim()).filter(Boolean);
+
 const app = express();
-app.use(cors({ origin: "*"}));
+
+// ---- CORS that works with credentials ----
+const corsOptions = {
+  origin: (origin, cb) => {
+    // allow no-origin (curl/postman) and whitelisted origins
+    if (!origin) return cb(null, true);
+    if (CORS_WHITELIST.length === 0) return cb(null, true);
+    if (CORS_WHITELIST.includes(origin)) return cb(null, true);
+    return cb(new Error("CORS blocked"), false);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-api-key"]
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+// JSON + small no-cache for API responses
 app.use(express.json({ limit: "5mb" }));
+app.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+});
 
-// ----------------- Minimal in-memory “session” -----------------
-// For demo/sandbox: gemmer tokens i RAM (1 bruger). I prod: brug DB.
+// ---- In-memory tokens (demo) ----
 let tikTokAuth = null;
-// shape:
-// {
-//   access_token, refresh_token, expires_in, refresh_expires_in,
-//   open_id, scope, obtain_at (Date.now())
-// }
 
-// ----------------- Helpers -----------------
+// ---- helpers ----
 const q = (params) =>
   Object.entries(params)
-    .filter(([,v]) => v !== undefined && v !== null && v !== "")
-    .map(([k,v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .filter(([, v]) => v !== undefined && v !== null && v !== "")
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
     .join("&");
 
 function mask(str, keep = 3) {
   if (!str) return "";
-  if (str.length <= keep) return "*".repeat(str.length);
-  return str.slice(0, keep) + "…" + str.slice(-keep);
+  return str.length <= keep ? "*".repeat(str.length) : str.slice(0, keep) + "…" + str.slice(-keep);
 }
 
 async function ttFetchJSON(url, opts = {}) {
@@ -54,52 +65,36 @@ async function ttFetchJSON(url, opts = {}) {
     }
   });
   const text = await r.text();
-  try {
-    const json = JSON.parse(text);
-    return { status: r.status, ok: r.ok, json, raw: text };
-  } catch {
-    return { status: r.status, ok: r.ok, json: null, raw: text };
-  }
+  try { return { status: r.status, ok: r.ok, json: JSON.parse(text), raw: text }; }
+  catch { return { status: r.status, ok: r.ok, json: null, raw: text }; }
 }
 
 async function exchangeCodeForToken(code) {
-  const url = "https://open.tiktokapis.com/v2/oauth/token/";
-  const body = {
-    client_key: TT_CLIENT_KEY,
-    client_secret: TT_CLIENT_SECRET,
-    code,
-    grant_type: "authorization_code",
-    redirect_uri: TT_REDIRECT
-  };
-
-  const res = await ttFetchJSON(url, { method: "POST", body: JSON.stringify(body) });
-  if (!res.ok) {
-    const err = new Error("TikTok token exchange failed");
-    err.meta = res;
-    throw err;
-  }
-  return res.json.data || res.json; // TikTok svarer data/obj afhængigt af produkt
+  const res = await ttFetchJSON("https://open.tiktokapis.com/v2/oauth/token/", {
+    method: "POST",
+    body: JSON.stringify({
+      client_key: TT_CLIENT_KEY,
+      client_secret: TT_CLIENT_SECRET,
+      code,
+      grant_type: "authorization_code",
+      redirect_uri: TT_REDIRECT
+    })
+  });
+  if (!res.ok) { const e = new Error("TikTok token exchange failed"); e.meta = res; throw e; }
+  return res.json.data || res.json;
 }
 
 async function fetchUserInfo(access_token) {
-  // Simpelt kald til user.info.basic
-  const url = "https://open.tiktokapis.com/v2/user/info/";
-  const body = { fields: ["open_id"] };
-  const res = await ttFetchJSON(url, {
+  return ttFetchJSON("https://open.tiktokapis.com/v2/user/info/", {
     method: "POST",
     headers: { Authorization: `Bearer ${access_token}` },
-    body: JSON.stringify(body)
+    body: JSON.stringify({ fields: ["open_id"] })
   });
-  return res;
 }
 
-// ----------------- Routes -----------------
+// ---- routes ----
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, ts: Date.now() });
-});
-
-// Fejlfinding — viser hvilke værdier serveren faktisk bruger
 app.get("/auth/tiktok/debug", (_req, res) => {
   res.json({
     client_key_present: !!TT_CLIENT_KEY,
@@ -109,97 +104,47 @@ app.get("/auth/tiktok/debug", (_req, res) => {
     client_secret_len: TT_CLIENT_SECRET.length,
     redirect_uri: TT_REDIRECT,
     public_base_url: PUBLIC_BASE_URL,
+    cors_whitelist: CORS_WHITELIST,
     has_tokens: !!tikTokAuth,
     open_id_preview: tikTokAuth?.open_id ? mask(tikTokAuth.open_id) : null
   });
 });
 
-// Giver korrekt authorize-URL (brug denne i Base44 UI)
 app.get("/auth/tiktok/url", (_req, res) => {
   const state = "state_epush_" + crypto.randomBytes(4).toString("hex");
   const scope = "user.info.basic,video.upload,video.publish";
-
-  const authorizeUrl =
+  const authorize_url =
     "https://www.tiktok.com/v2/auth/authorize/?" +
-    q({
-      client_key: TT_CLIENT_KEY,
-      scope,
-      response_type: "code",
-      redirect_uri: TT_REDIRECT,
-      state
-    });
-
-  res.json({ authorize_url: authorizeUrl });
+    q({ client_key: TT_CLIENT_KEY, scope, response_type: "code", redirect_uri: TT_REDIRECT, state });
+  res.json({ authorize_url });
 });
 
-// TikTok redirect rammer her. Vi bytter code -> tokens og henter open_id
 app.get("/auth/tiktok/callback", async (req, res) => {
   const { code, state, error, error_description } = req.query;
-
   try {
-    if (error) {
-      return res
-        .status(400)
-        .send(`<pre>TikTok Login ERROR\n\n${error}: ${error_description || ""}\nstate: ${state || ""}</pre>`);
-    }
-    if (!code) {
-      return res.status(400).send("<pre>Missing code</pre>");
-    }
+    if (error) return res.status(400).send(`<pre>TikTok Login ERROR\n\n${error}: ${error_description || ""}\nstate: ${state || ""}</pre>`);
+    if (!code) return res.status(400).send("<pre>Missing code</pre>");
 
     const tokens = await exchangeCodeForToken(code);
+    tikTokAuth = { ...tokens, obtain_at: Date.now() };
 
-    // Gem midlertidigt
-    tikTokAuth = {
-      ...tokens,
-      obtain_at: Date.now()
-    };
-
-    // Hent open_id (så Base44 kan vise "connected")
     const me = await fetchUserInfo(tokens.access_token);
-    if (me.ok && me.json?.data?.user?.open_id) {
-      tikTokAuth.open_id = me.json.data.user.open_id;
-    }
+    if (me.ok && me.json?.data?.user?.open_id) tikTokAuth.open_id = me.json.data.user.open_id;
 
-    // Simpelt menneskeligt svar (så du kan debug i browser)
-    res
-      .status(200)
-      .send(
-        `<pre>TikTok Login OK\nstate: ${state || ""}\n\n${JSON.stringify(
-          { tokens: { ...tokens, refresh_token: "•••masked•••" }, me: me.json || me.raw },
-          null,
-          2
-        )}\n\nGem tokens i din database/session i stedet for at vise dem i produktion.</pre>`
-      );
+    res.status(200).send(
+      `<pre>TikTok Login OK\nstate: ${state || ""}\n\n${JSON.stringify(
+        { tokens: { ...tokens, refresh_token: "•••masked•••" }, me: me.json || me.raw }, null, 2
+      )}\n\nGem tokens i DB/session i stedet for at vise dem i produktion.</pre>`
+    );
   } catch (err) {
-    console.error("TT TOKEN EXCHANGE FAILED", {
-      using_redirect: TT_REDIRECT,
-      client_key_len: TT_CLIENT_KEY?.length,
-      detail: err?.meta || String(err)
-    });
-
-    const meta = err?.meta;
-    return res
-      .status(500)
-      .send(
-        `<pre>TikTok Login ERROR\n\n${JSON.stringify(
-          {
-            message: "Token exchange failed",
-            redirect_used: TT_REDIRECT,
-            tiktok_response: meta || null
-          },
-          null,
-          2
-        )}</pre>`
-      );
+    console.error("TT TOKEN EXCHANGE FAILED", { redirect: TT_REDIRECT, detail: err?.meta || String(err) });
+    res.status(500).send(`<pre>TikTok Login ERROR\n\n${JSON.stringify({ redirect: TT_REDIRECT, resp: err?.meta || null }, null, 2)}</pre>`);
   }
 });
 
-// Status til Base44 — fortæller om der er en forbundet TikTok-bruger
 app.get("/auth/tiktok/status", (_req, res) => {
-  if (!tikTokAuth?.access_token) {
-    return res.json({ connected: false });
-  }
-  return res.json({
+  if (!tikTokAuth?.access_token) return res.json({ connected: false });
+  res.json({
     connected: true,
     open_id: tikTokAuth.open_id || null,
     open_id_preview: tikTokAuth.open_id ? mask(tikTokAuth.open_id) : null,
@@ -207,42 +152,25 @@ app.get("/auth/tiktok/status", (_req, res) => {
   });
 });
 
-// (Stub) Post til TikTok — klar til at udvides med Sandbox upload/publish flow.
-// Lad Base44 kalde denne efter render-job, så vi har en fast integration.
 app.post("/tiktok/post", async (req, res) => {
-  if (!tikTokAuth?.access_token || !tikTokAuth?.open_id) {
-    return res.status(401).json({
-      ok: false,
-      error: "not_connected",
-      message: "Connect TikTok under 'TikTok Connect & Post' først."
-    });
-  }
+  if (!tikTokAuth?.access_token || !tikTokAuth?.open_id)
+    return res.status(401).json({ ok: false, error: "not_connected", message: "Connect TikTok først." });
 
-  // Modtag fra Base44:
   const { video_url, caption } = req.body || {};
+  if (!video_url)
+    return res.status(400).json({ ok: false, error: "missing_video_url", message: "Send { video_url }." });
 
-  if (!video_url) {
-    return res.status(400).json({
-      ok: false,
-      error: "missing_video_url",
-      message: "Send { video_url } i request body."
-    });
-  }
-
-  // Her kan du implementere TikTok Sandbox “upload by URL + publish”-flow.
-  // Indtil vi aktiverer det fuldt ud, svarer vi 501 så UI’en kan vise tydelig besked.
+  // Placeholder:
   return res.status(501).json({
-    ok: false,
-    error: "not_implemented_yet",
-    message:
-      "Endpoint er klar, men posting til TikTok (Sandbox) er ikke aktiveret i denne build. OAuth og status virker.",
+    ok: false, error: "not_implemented_yet",
+    message: "OAuth virker; posting ikke aktiveret i denne build.",
     received: { video_url, caption }
   });
 });
 
-// ----------------- Start -----------------
 app.listen(PORT, () => {
   console.log(`✅ Server on ${PORT}`);
   console.log(`🔧 PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}`);
   console.log(`🔧 TT_REDIRECT:     ${TT_REDIRECT}`);
+  console.log(`🔧 CORS_WHITELIST: ${CORS_WHITELIST.join(",") || "(reflect any origin)"}`);
 });
