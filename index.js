@@ -1,4 +1,4 @@
-// index.js (ESM) — EuropePUSH backend (TikTok OAuth, robust CORS, popup-safe callback)
+// index.js (ESM) — EuropePUSH backend: TikTok OAuth + JSON-safe errors for /auth/* and /tiktok/*
 
 import express from "express";
 import cors from "cors";
@@ -6,21 +6,25 @@ import fetch from "node-fetch";
 import crypto from "crypto";
 
 const PORT = Number(process.env.PORT || 10000);
+
+// IMPORTANT: must match your public API base (used in TikTok redirect)
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://api.europepush.com";
+
+// TikTok app creds (use your Sandbox or Production set!)
 const TT_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY || "";
 const TT_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || "";
 const TT_REDIRECT = `${PUBLIC_BASE_URL}/auth/tiktok/callback`;
 
-// Optional: restrict who can call the API (comma-separated origins).
+// Comma-separated whitelist origins, e.g. "https://app.base44.io,https://studio.base44.io"
 const CORS_WHITELIST = (process.env.CORS_WHITELIST || "")
   .split(",").map(s => s.trim()).filter(Boolean);
 
 const app = express();
 
-// ---------- CORS that works with credentials ----------
+// ---------- CORS ----------
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // curl/postman
+    if (!origin) return cb(null, true);
     if (CORS_WHITELIST.length === 0) return cb(null, true);
     if (CORS_WHITELIST.includes(origin)) return cb(null, true);
     return cb(new Error("CORS blocked"), false);
@@ -32,6 +36,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
+// ---------- Body & headers ----------
 app.use(express.json({ limit: "5mb" }));
 app.use((req, res, next) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
@@ -40,10 +45,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- memory store (demo only) ----------
-let tikTokAuth = null;
+// ---------- In-memory store (demo) ----------
+let tikTokAuth = null; // { access_token, refresh_token, open_id, scope, obtain_at, ... }
 
-// ---------- helpers ----------
+// ---------- Utils ----------
 function qs(obj) {
   return Object.entries(obj)
     .filter(([, v]) => v !== undefined && v !== null && v !== "")
@@ -56,13 +61,13 @@ function mask(s, keep = 3) {
 }
 async function fetchJSON(url, opts = {}) {
   const r = await fetch(url, opts);
-  const t = await r.text();
-  try { return { ok: r.ok, status: r.status, json: JSON.parse(t), raw: t }; }
-  catch { return { ok: r.ok, status: r.status, json: null, raw: t }; }
+  const text = await r.text();
+  try { return { ok: r.ok, status: r.status, json: JSON.parse(text), raw: text }; }
+  catch { return { ok: r.ok, status: r.status, json: null, raw: text }; }
 }
 
-// TikTok: exchange auth code -> tokens (MUST be x-www-form-urlencoded)
 async function exchangeCodeForToken(code) {
+  // TikTok wants x-www-form-urlencoded
   const body = new URLSearchParams({
     client_key: TT_CLIENT_KEY,
     client_secret: TT_CLIENT_SECRET,
@@ -77,27 +82,36 @@ async function exchangeCodeForToken(code) {
     body
   });
   if (!res.ok) {
-    const e = new Error("token_exchange_failed");
-    e.meta = res;
-    throw e;
+    const err = new Error("token_exchange_failed");
+    err.meta = res;
+    throw err;
   }
   return res.json.data || res.json;
 }
 
 async function fetchUserInfo(access_token) {
-  // This endpoint accepts JSON
   return fetchJSON("https://open.tiktokapis.com/v2/user/info/", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${access_token}`
+      "Authorization": `Bearer ${access_token}`
     },
     body: JSON.stringify({ fields: ["open_id"] })
   });
 }
 
-// ---------- routes ----------
+// ---------- Health & debug ----------
 app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get("/__whoami", (_req, res) => {
+  res.json({
+    ok: true,
+    public_base_url: PUBLIC_BASE_URL,
+    redirect_uri: TT_REDIRECT,
+    cors_whitelist: CORS_WHITELIST,
+    client_key_set: !!TT_CLIENT_KEY,
+    client_secret_set: !!TT_CLIENT_SECRET
+  });
+});
 
 app.get("/auth/tiktok/debug", (_req, res) => {
   res.json({
@@ -114,8 +128,23 @@ app.get("/auth/tiktok/debug", (_req, res) => {
   });
 });
 
-// Convenience: redirect immediately to TikTok (optional)
-app.get("/auth/tiktok/start", (req, res) => {
+// ---------- OAuth: build URL / start ----------
+app.get("/auth/tiktok/url", (_req, res) => {
+  const state = "state_epush_" + crypto.randomBytes(4).toString("hex");
+  const scope = "user.info.basic,video.upload,video.publish";
+  const authorize_url =
+    "https://www.tiktok.com/v2/auth/authorize/?" +
+    qs({
+      client_key: TT_CLIENT_KEY,
+      scope,
+      response_type: "code",
+      redirect_uri: TT_REDIRECT,
+      state
+    });
+  res.json({ authorize_url, state });
+});
+
+app.get("/auth/tiktok/start", (_req, res) => {
   const state = "state_epush_" + crypto.randomBytes(4).toString("hex");
   const scope = "user.info.basic,video.upload,video.publish";
   const authorize_url =
@@ -130,23 +159,7 @@ app.get("/auth/tiktok/start", (req, res) => {
   res.redirect(authorize_url);
 });
 
-// Return the authorize URL as JSON (what Base44 uses)
-app.get("/auth/tiktok/url", (req, res) => {
-  const state = "state_epush_" + crypto.randomBytes(4).toString("hex");
-  const scope = "user.info.basic,video.upload,video.publish";
-  const authorize_url =
-    "https://www.tiktok.com/v2/auth/authorize/?" +
-    qs({
-      client_key: TT_CLIENT_KEY,
-      scope,
-      response_type: "code",
-      redirect_uri: TT_REDIRECT,
-      state
-    });
-  res.json({ authorize_url });
-});
-
-// IMPORTANT: popup-safe callback that posts result back to opener
+// ---------- OAuth callback (popup-safe) ----------
 app.get("/auth/tiktok/callback", async (req, res) => {
   const { code, state, error, error_description } = req.query;
   const payload = { ok: false, state: state || null };
@@ -162,7 +175,9 @@ app.get("/auth/tiktok/callback", async (req, res) => {
       tikTokAuth = { ...tokens, obtain_at: Date.now() };
 
       const me = await fetchUserInfo(tokens.access_token);
-      if (me.ok && me.json?.data?.user?.open_id) tikTokAuth.open_id = me.json.data.user.open_id;
+      if (me.ok && me.json?.data?.user?.open_id) {
+        tikTokAuth.open_id = me.json.data.user.open_id;
+      }
 
       payload.ok = true;
       payload.tokens = { ...tokens, refresh_token: "•••masked•••" };
@@ -173,10 +188,11 @@ app.get("/auth/tiktok/callback", async (req, res) => {
     payload.detail = e?.meta || String(e);
   }
 
-  // If opened as a popup, send the result back to the opener and close.
   const html = `
 <!doctype html>
-<html><body>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>TikTok Login</title>
+<body style="font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif">
 <script>
   (function () {
     var data = ${JSON.stringify(payload)};
@@ -185,18 +201,17 @@ app.get("/auth/tiktok/callback", async (req, res) => {
         window.opener.postMessage({ type: 'tiktok_oauth_result', data }, '*');
       }
     } catch (e) {}
-    // Fallback: show minimal text so user sees something if popup wasn't used
-    document.body.innerHTML = '<pre>' + ${JSON.stringify(
-      "TikTok Login OK (popup mode). You can close this window."
-    )} + '\\n' + JSON.stringify(data, null, 2) + '</pre>';
-    setTimeout(function(){ window.close(); }, 800);
+    document.body.innerHTML =
+      '<pre style="white-space:pre-wrap;word-break:break-word;">TikTok Login OK (popup). You can close this window.\\n\\n'
+      + JSON.stringify(data, null, 2) + '</pre>';
+    setTimeout(function(){ window.close(); }, 900);
   })();
 </script>
-</body></html>`;
+</body>`;
   res.status(200).type("html").send(html);
 });
 
-// Frontend can poll this
+// ---------- Status & account ----------
 app.get("/auth/tiktok/status", (_req, res) => {
   if (!tikTokAuth?.access_token) return res.json({ connected: false });
   res.json({
@@ -207,16 +222,51 @@ app.get("/auth/tiktok/status", (_req, res) => {
   });
 });
 
-// placeholder for future posting
+app.get("/tiktok/account", (_req, res) => {
+  if (!tikTokAuth?.access_token) return res.json({ connected: false, account: null });
+  res.json({
+    connected: true,
+    account: {
+      open_id: tikTokAuth.open_id || null,
+      label: tikTokAuth.open_id ? `Sandbox · ${mask(tikTokAuth.open_id)}` : "Sandbox · <unknown>"
+    }
+  });
+});
+
+app.post("/auth/tiktok/clear", (_req, res) => {
+  tikTokAuth = null;
+  res.json({ ok: true });
+});
+
+// ---------- Example posting placeholder ----------
 app.post("/tiktok/post", (req, res) => {
-  if (!tikTokAuth?.access_token || !tikTokAuth?.open_id)
+  if (!tikTokAuth?.access_token || !tikTokAuth?.open_id) {
     return res.status(401).json({ ok: false, error: "not_connected" });
-  res.status(501).json({ ok: false, error: "not_implemented_yet" });
+  }
+  // TODO: implement /video/upload + /video/publish with TikTok Sandbox.
+  return res.status(501).json({ ok: false, error: "not_implemented_yet" });
+});
+
+// ---------- JSON 404 for /auth/* and /tiktok/* ----------
+function jsonNotFound(req, res) {
+  res.status(404).json({ ok: false, error: "not_found", path: req.path });
+}
+app.use("/auth", (req, res, next) => jsonNotFound(req, res));
+app.use("/tiktok", (req, res, next) => jsonNotFound(req, res));
+
+// ---------- JSON error handler for /auth/* and /tiktok/* ----------
+app.use((err, req, res, _next) => {
+  const wantsJson = req.path.startsWith("/auth/") || req.path.startsWith("/tiktok/");
+  if (wantsJson) {
+    return res.status(500).json({ ok: false, error: "server_error", message: err?.message || String(err) });
+  }
+  // Fallback: default HTML for non-API paths
+  res.status(500).send("<h1>Server error</h1>");
 });
 
 app.listen(PORT, () => {
   console.log(`✅ Server on ${PORT}`);
   console.log(`🔧 PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}`);
   console.log(`🔧 TT_REDIRECT:     ${TT_REDIRECT}`);
-  console.log(`🔧 CORS_WHITELIST: ${CORS_WHITELIST.join(",") || "(reflect any origin)"}`);
+  console.log(`🔧 CORS_WHITELIST: ${CORS_WHITELIST.join(",") || "(any)"}`);
 });
