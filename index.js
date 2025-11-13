@@ -19,13 +19,13 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 
 const TT_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY || "";
 const TT_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || "";
-const TT_REDIRECT = process.env.TIKTOK_REDIRECT_URL || ""; // must match TikTok portal
-const PUBLIC_BASE = `https://api.europepush.com`; // bruges til OAuth UI-links
+const TT_REDIRECT = process.env.TIKTOK_REDIRECT_URL || ""; // fx https://api.europepush.com/auth/tiktok/callback
+
+const PUBLIC_BASE = "https://api.europepush.com";
 
 // ----------------- APP + CORS -----------------
 const app = express();
 
-// CORS – TILLAD frontend på europepush.com (og localhost til dev)
 const ALLOWED_ORIGINS = [
   "https://europepush.com",
   "https://www.europepush.com",
@@ -44,7 +44,10 @@ app.use((req, res, next) => {
     "Origin, X-Requested-With, Content-Type, Accept, x-api-key"
   );
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
+  if (req.method === "OPTIONS") {
+    // preflight – her må den godt være 204, men KUN for OPTIONS
+    return res.sendStatus(204);
+  }
   next();
 });
 
@@ -55,15 +58,16 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TMP = os.tmpdir();
 
-// lille in-memory storage (BYT til DB i prod)
+// simpelt in-memory token-lager (brug DB i produktion)
 let TIKTOK_TOKENS = /** @type {null | {
   access_token:string, refresh_token:string, open_id?:string, scope?:string
 }} */ (null);
 
-// basic guard
 function requireApiKey(req, res, next) {
   const k = req.header("x-api-key") || "";
-  if (!API_KEY || k !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+  if (!API_KEY || k !== API_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
   next();
 }
 
@@ -111,7 +115,6 @@ async function ffmpegTranscodeToVertical(inFile) {
   const id = nowId("out_job");
   const outFile = path.join(TMP, `${id}.mp4`);
 
-  // 1080x1920 letterbox + h264 fast
   const vf =
     "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=fast_bilinear," +
     "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2," +
@@ -177,22 +180,36 @@ async function uploadToSupabase(localFile, jobId) {
   return data.publicUrl;
 }
 
-// ----------------- ROUTES: HEALTH -----------------
+// ----------------- HEALTH -----------------
 app.get("/health", (_req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-// ----------------- ROUTES: TikTok OAuth -----------------
+// ----------------- TIKTOK OAUTH -----------------
 
 // Base44 kalder denne for at få auth-link
-app.get("/auth/tiktok/connect", (_req, res) => {
+// Håndter både GET og POST → så frontend er ligeglad
+app.all("/auth/tiktok/connect", (req, res) => {
+  console.log("[/auth/tiktok/connect] method:", req.method);
+
   if (!TT_CLIENT_KEY || !TT_CLIENT_SECRET || !TT_REDIRECT) {
-    return res.status(500).json({ ok: false, error: "misconfigured_keys" });
+    console.error("TikTok keys/redirect misconfigured");
+    return res
+      .status(500)
+      .json({ ok: false, error: "misconfigured_keys", authorize_url: null });
   }
-  res.json({ authorize_url: buildTikTokAuthorizeURL() });
+
+  const url = buildTikTokAuthorizeURL();
+  console.log("[/auth/tiktok/connect] authorize_url:", url);
+
+  // VIGTIGT: altid JSON + 200 (ingen 204 her)
+  return res.status(200).json({
+    ok: true,
+    authorize_url: url,
+  });
 });
 
-// status til UI
+// status til UI – viser om der er tokens
 app.get("/auth/tiktok/status", (_req, res) => {
   const connected = !!(TIKTOK_TOKENS && TIKTOK_TOKENS.access_token);
   res.json({
@@ -203,7 +220,7 @@ app.get("/auth/tiktok/status", (_req, res) => {
   });
 });
 
-// debug (viser længder – ikke værdier)
+// debug (viser kun længder, ikke secrets)
 app.get("/auth/tiktok/debug", (_req, res) => {
   res.json({
     client_key_present: !!TT_CLIENT_KEY,
@@ -214,13 +231,12 @@ app.get("/auth/tiktok/debug", (_req, res) => {
   });
 });
 
-// TikTok callback: bytter code -> access_token, henter user info
+// callback fra TikTok
 app.get("/auth/tiktok/callback", async (req, res) => {
   const code = String(req.query.code || "");
   const state = String(req.query.state || "");
   if (!code) return res.status(400).send("missing code");
 
-  // token exchange (x-www-form-urlencoded påkrævet)
   const form = new URLSearchParams();
   form.set("client_key", TT_CLIENT_KEY);
   form.set("client_secret", TT_CLIENT_SECRET);
@@ -238,8 +254,6 @@ app.get("/auth/tiktok/callback", async (req, res) => {
 
   if (tokenResp.ok && tokenResp.json?.access_token) {
     const access = tokenResp.json.access_token;
-
-    // hent bruger info (fields param nødvendig)
     const meUrl = "https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name";
     const me = await fetchJSON(meUrl, {
       headers: { Authorization: `Bearer ${access}` },
@@ -256,13 +270,12 @@ app.get("/auth/tiktok/callback", async (req, res) => {
       meInfo = { data: me.json.data.user };
     } else {
       meInfo = {
-        warn: "user.info returned non-JSON or error",
+        warn: "user.info returned error or non-JSON",
         status: me.status,
       };
     }
   }
 
-  // Enkel “OK” side (så du kan se hurtigt i browseren)
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.end(
     `<h1>TikTok Login OK</h1>
@@ -272,26 +285,31 @@ app.get("/auth/tiktok/callback", async (req, res) => {
   );
 });
 
-// simple kontoliste til UI (i sandbox har vi 1 bruger)
+// simpelt account-endpoint – 1 “konto” baseret på open_id
 app.get("/tiktok/accounts", (_req, res) => {
-  if (!TIKTOK_TOKENS?.open_id) return res.json({ ok: true, accounts: [] });
+  if (!TIKTOK_TOKENS?.open_id) {
+    return res.json({ ok: true, accounts: [] });
+  }
   res.json({
     ok: true,
     accounts: [
-      { id: TIKTOK_TOKENS.open_id, label: `sandbox:${TIKTOK_TOKENS.open_id.slice(0, 6)}…` },
+      {
+        id: TIKTOK_TOKENS.open_id,
+        label: `sandbox:${TIKTOK_TOKENS.open_id.slice(0, 6)}…`,
+      },
     ],
   });
 });
 
-// ----------------- ROUTES: Jobs (Render + upload) -----------------
-
+// ----------------- JOBS -----------------
 app.post("/jobs", requireApiKey, async (req, res) => {
   try {
     const { source_video_url, postToTikTok = false, tiktok_account_ids = [] } = req.body || {};
 
-    if (!source_video_url) return res.status(400).json({ error: "source_video_url_required" });
+    if (!source_video_url) {
+      return res.status(400).json({ error: "source_video_url_required" });
+    }
 
-    // hvis vi skal poste, kræv at OAuth er gennemført
     if (postToTikTok) {
       if (!TIKTOK_TOKENS?.access_token) {
         return res.status(400).json({ error: "tiktok_not_connected" });
@@ -302,31 +320,26 @@ app.post("/jobs", requireApiKey, async (req, res) => {
     }
 
     const jobId = nowId("job");
-    // 1) download
+
     const localIn = await downloadToTmp(source_video_url);
-    // 2) transcode
     const localOut = await ffmpegTranscodeToVertical(localIn);
-    // 3) upload til supabase (public URL tilbage)
     const publicUrl = await uploadToSupabase(localOut, jobId);
 
-    const payload = {
+    res.json({
       ok: true,
       job_id: jobId,
       output_url: publicUrl,
-      // NOTE: TikTok posting gøres i en særskilt knap/flow (ikke i dette endpoint)
       note: postToTikTok
-        ? "Transcode ok. Post to TikTok via /tiktok/post (ikke implementeret i denne fil)."
+        ? "Transcode ok. Post til TikTok kan bygges i et separat endpoint."
         : "Transcode ok.",
-    };
-
-    res.json(payload);
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-// ----------------- ROUTES: Utility -----------------
+// ----------------- MISC -----------------
 app.get("/", (_req, res) => {
   res.type("text").send("✅ EuropePUSH backend up");
 });
@@ -338,10 +351,14 @@ app.use((req, res) => {
 // ----------------- START -----------------
 app.listen(PORT, () => {
   console.log(`✅ Server on ${PORT}`);
-  console.log(`🔧 ENV SUPABASE_URL: ${SUPABASE_URL ? "present" : "missing"}`);
-  console.log(`🔧 ENV SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY ? "present" : "missing"}`);
-  console.log(`🔧 ENV API_KEY: ${API_KEY ? "present" : "missing"}`);
-  console.log(`🔧 TikTok keys: key=${TT_CLIENT_KEY ? "present" : "missing"} secret=${TT_CLIENT_SECRET ? "present" : "missing"}`);
+  console.log(`🔧 SUPABASE_URL: ${SUPABASE_URL ? "present" : "missing"}`);
+  console.log(`🔧 SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY ? "present" : "missing"}`);
+  console.log(`🔧 API_KEY: ${API_KEY ? "present" : "missing"}`);
+  console.log(
+    `🔧 TikTok keys: key=${TT_CLIENT_KEY ? "present" : "missing"} secret=${
+      TT_CLIENT_SECRET ? "present" : "missing"
+    }`
+  );
   console.log(`🔧 Redirect: ${TT_REDIRECT || "(missing)"}`);
-  console.log(`🔗 Connect URL: ${PUBLIC_BASE}/auth/tiktok/connect`);
+  console.log(`🔗 Connect URL (backend): ${PUBLIC_BASE}/auth/tiktok/connect`);
 });
