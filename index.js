@@ -1,86 +1,121 @@
-// index.js — backend with FFmpeg + Supabase + persistent TikTok OAuth + robust CORS/connect flow
+// index.js (ESM)
 import express from "express";
-import cors from "cors";
-import fetch from "node-fetch";
-import { createClient } from "@supabase/supabase-js";
-import { execa } from "execa";
-import ffmpeg from "ffmpeg-static";
-import fs from "fs";
-import fsp from "fs/promises";
+import crypto from "crypto";
 import os from "os";
 import path from "path";
-import crypto from "crypto";
+import fs from "fs/promises";
+import fss from "fs";
+import { fileURLToPath } from "url";
+import { createClient } from "@supabase/supabase-js";
+import ffmpegBin from "ffmpeg-static";
+import { execa } from "execa";
+import fetch from "node-fetch";
 
-// ---------- ENV ----------
+// ----------------- ENV -----------------
 const PORT = Number(process.env.PORT || 10000);
 const API_KEY = process.env.API_KEY || "";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
-const VIDEO_JITTER = (process.env.VIDEO_JITTER || "").toLowerCase() === "true";
 
-const TIKTOK_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY || "";
-const TIKTOK_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || "";
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://api.europepush.com";
-const TIKTOK_REDIRECT = `${PUBLIC_BASE_URL}/auth/tiktok/callback`;
+const TT_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY || "";
+const TT_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || "";
+const TT_REDIRECT = process.env.TIKTOK_REDIRECT_URL || ""; // must match TikTok portal
+const PUBLIC_BASE = `https://api.europepush.com`; // bruges til OAuth UI-links
 
-// ---------- Clients ----------
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-
-// ---------- App ----------
+// ----------------- APP + CORS -----------------
 const app = express();
 
-// Strong CORS + preflight (prevents “Failed to fetch” from OPTIONS)
+// CORS – TILLAD frontend på europepush.com (og localhost til dev)
+const ALLOWED_ORIGINS = [
+  "https://europepush.com",
+  "https://www.europepush.com",
+  "http://localhost:3000",
+];
+
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  const origin = req.headers.origin || "";
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
   res.setHeader(
     "Access-Control-Allow-Headers",
     "Origin, X-Requested-With, Content-Type, Accept, x-api-key"
   );
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// Also keep cors() for good measure
-app.use(cors());
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "20mb" }));
 
-// ---------- Tiny in-memory job store ----------
-const jobs = new Map();
+// ----------------- HELPERS -----------------
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const TMP = os.tmpdir();
 
-// ---------- TikTok auth persistence ----------
-const AUTH_FILE = path.join(process.cwd(), "tiktok_auth.json");
-let tikTokAuth = null;
-if (fs.existsSync(AUTH_FILE)) {
-  try {
-    tikTokAuth = JSON.parse(fs.readFileSync(AUTH_FILE, "utf8"));
-  } catch {}
+// lille in-memory storage (BYT til DB i prod)
+let TIKTOK_TOKENS = /** @type {null | {
+  access_token:string, refresh_token:string, open_id?:string, scope?:string
+}} */ (null);
+
+// basic guard
+function requireApiKey(req, res, next) {
+  const k = req.header("x-api-key") || "";
+  if (!API_KEY || k !== API_KEY) return res.status(401).json({ error: "unauthorized" });
+  next();
 }
-const saveTikTokAuth = (data) => {
-  tikTokAuth = data;
-  fs.writeFileSync(AUTH_FILE, JSON.stringify(data, null, 2));
-};
 
-// ---------- Helpers ----------
-const nowId = (pfx = "job") =>
-  `${pfx}_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+function nowId(prefix) {
+  return `${prefix}_${crypto.randomBytes(4).toString("hex")}`;
+}
 
-const downloadToTmp = async (url) => {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`download failed: ${r.status} ${r.statusText}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  const tmp = path.join(os.tmpdir(), `in_${nowId("vid")}.mp4`);
-  await fsp.writeFile(tmp, buf);
-  return tmp;
-};
+function buildTikTokAuthorizeURL() {
+  const params = new URLSearchParams({
+    client_key: TT_CLIENT_KEY,
+    scope: "user.info.basic,video.upload,video.publish",
+    response_type: "code",
+    redirect_uri: TT_REDIRECT,
+    state: nowId("state_epush"),
+  });
+  return `https://www.tiktok.com/v2/auth/authorize/?${params.toString()}`;
+}
 
-const runFFmpeg = async (inPath) => {
-  const outPath = path.join(os.tmpdir(), `out_${nowId("clip")}.mp4`);
-  const scalePad =
-    "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int," +
+async function fetchJSON(url, opts = {}) {
+  const res = await fetch(url, opts);
+  const text = await res.text();
+  try {
+    return { status: res.status, ok: res.ok, json: JSON.parse(text) };
+  } catch {
+    return { status: res.status, ok: res.ok, text };
+  }
+}
+
+async function downloadToTmp(url) {
+  const id = nowId("in_job");
+  const file = path.join(TMP, `${id}.mp4`);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`download failed ${res.status}`);
+  await new Promise((resolve, reject) => {
+    const ws = fss.createWriteStream(file);
+    res.body.pipe(ws);
+    res.body.on("error", reject);
+    ws.on("finish", resolve);
+    ws.on("error", reject);
+  });
+  return file;
+}
+
+async function ffmpegTranscodeToVertical(inFile) {
+  const id = nowId("out_job");
+  const outFile = path.join(TMP, `${id}.mp4`);
+
+  // 1080x1920 letterbox + h264 fast
+  const vf =
+    "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=fast_bilinear," +
     "pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2," +
     "crop=1080-4:1920-4:2:2,pad=1080:1920:(1080-iw)/2:(1920-ih)/2";
-  const vf = VIDEO_JITTER ? `${scalePad},hue=h=0.4*PI/180:s=1` : `${scalePad}`;
 
   const args = [
     "-y",
@@ -88,12 +123,8 @@ const runFFmpeg = async (inPath) => {
     "-nostdin",
     "-threads",
     "1",
-    "-filter_threads",
-    "1",
-    "-filter_complex_threads",
-    "1",
     "-i",
-    inPath,
+    inFile,
     "-vf",
     vf,
     "-r",
@@ -109,13 +140,13 @@ const runFFmpeg = async (inPath) => {
     "-pix_fmt",
     "yuv420p",
     "-preset",
-    "fast",
+    "ultrafast",
     "-crf",
-    "20",
+    "21",
     "-tune",
     "fastdecode",
     "-x264-params",
-    "ref=3:bframes=3:rc-lookahead=12:keyint=150:min-keyint=30:scenecut=0",
+    "ref=1:bframes=2:rc-lookahead=8:keyint=120:min-keyint=24:scenecut=0",
     "-maxrate",
     "3500k",
     "-bufsize",
@@ -123,223 +154,194 @@ const runFFmpeg = async (inPath) => {
     "-max_muxing_queue_size",
     "1024",
     "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
+    "copy",
     "-movflags",
     "+faststart",
-    outPath,
+    outFile,
   ];
-  await execa(ffmpeg, args, { stdio: "inherit" });
-  return outPath;
-};
 
-const uploadToSupabase = async (localPath, destPath) => {
-  const data = await fsp.readFile(localPath);
-  const { error } = await supabase.storage
-    .from("outputs")
-    .upload(destPath, data, { upsert: true, contentType: "video/mp4" });
-  if (error) throw error;
-  const { data: pub } = supabase.storage.from("outputs").getPublicUrl(destPath);
-  return pub?.publicUrl;
-};
+  await execa(ffmpegBin, args, { stdio: "inherit" });
+  return outFile;
+}
 
-const qs = (obj) =>
-  Object.entries(obj)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-    .join("&");
-
-const tikTokToken = async ({ code }) => {
-  const body = new URLSearchParams({
-    client_key: TIKTOK_CLIENT_KEY,
-    client_secret: TIKTOK_CLIENT_SECRET,
-    code,
-    grant_type: "authorization_code",
-    redirect_uri: TIKTOK_REDIRECT,
+async function uploadToSupabase(localFile, jobId) {
+  const bucket = "outputs";
+  const key = `jobs/${jobId}/clip_${Date.now()}.mp4`;
+  const fileBuf = await fs.readFile(localFile);
+  const { error } = await supabase.storage.from(bucket).upload(key, fileBuf, {
+    contentType: "video/mp4",
+    upsert: true,
   });
-  const r = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
+  if (error) throw error;
+  const { data } = supabase.storage.from(bucket).getPublicUrl(key);
+  return data.publicUrl;
+}
+
+// ----------------- ROUTES: HEALTH -----------------
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
+});
+
+// ----------------- ROUTES: TikTok OAuth -----------------
+
+// Base44 kalder denne for at få auth-link
+app.get("/auth/tiktok/connect", (_req, res) => {
+  if (!TT_CLIENT_KEY || !TT_CLIENT_SECRET || !TT_REDIRECT) {
+    return res.status(500).json({ ok: false, error: "misconfigured_keys" });
+  }
+  res.json({ authorize_url: buildTikTokAuthorizeURL() });
+});
+
+// status til UI
+app.get("/auth/tiktok/status", (_req, res) => {
+  const connected = !!(TIKTOK_TOKENS && TIKTOK_TOKENS.access_token);
+  res.json({
+    ok: true,
+    connected,
+    open_id: TIKTOK_TOKENS?.open_id || null,
+    scope: TIKTOK_TOKENS?.scope || null,
+  });
+});
+
+// debug (viser længder – ikke værdier)
+app.get("/auth/tiktok/debug", (_req, res) => {
+  res.json({
+    client_key_present: !!TT_CLIENT_KEY,
+    client_key_len: TT_CLIENT_KEY.length,
+    client_secret_present: !!TT_CLIENT_SECRET,
+    client_secret_len: TT_CLIENT_SECRET.length,
+    redirect_uri: TT_REDIRECT,
+  });
+});
+
+// TikTok callback: bytter code -> access_token, henter user info
+app.get("/auth/tiktok/callback", async (req, res) => {
+  const code = String(req.query.code || "");
+  const state = String(req.query.state || "");
+  if (!code) return res.status(400).send("missing code");
+
+  // token exchange (x-www-form-urlencoded påkrævet)
+  const form = new URLSearchParams();
+  form.set("client_key", TT_CLIENT_KEY);
+  form.set("client_secret", TT_CLIENT_SECRET);
+  form.set("grant_type", "authorization_code");
+  form.set("code", code);
+  form.set("redirect_uri", TT_REDIRECT);
+
+  const tokenResp = await fetchJSON("https://open.tiktokapis.com/v2/oauth/token/", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
+    body: form.toString(),
   });
-  return r.json();
-};
 
-// ---------- Health ----------
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, uptime: process.uptime(), tikTokConnected: !!tikTokAuth?.access_token })
-);
+  let meInfo = { warn: "user.info not fetched" };
 
-// ---------- TikTok OAuth ----------
+  if (tokenResp.ok && tokenResp.json?.access_token) {
+    const access = tokenResp.json.access_token;
 
-// JSON connect endpoint (UI fetches this, opens returned URL)
-app.get("/auth/tiktok/connect", (req, res) => {
-  const state = "state_epush_" + crypto.randomBytes(4).toString("hex");
-  const authorize_url =
-    "https://www.tiktok.com/v2/auth/authorize/?" +
-    qs({
-      client_key: TIKTOK_CLIENT_KEY,
-      scope: "user.info.basic,video.upload,video.publish",
-      response_type: "code",
-      redirect_uri: TIKTOK_REDIRECT,
-      state,
+    // hent bruger info (fields param nødvendig)
+    const meUrl = "https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name";
+    const me = await fetchJSON(meUrl, {
+      headers: { Authorization: `Bearer ${access}` },
     });
-  res.json({ ok: true, authorize_url, state });
-});
 
-// Legacy helpers (kept for compatibility)
-app.get("/auth/tiktok/url", (req, res) => {
-  const state = "state_epush_" + crypto.randomBytes(4).toString("hex");
-  const url =
-    "https://www.tiktok.com/v2/auth/authorize/?" +
-    qs({
-      client_key: TIKTOK_CLIENT_KEY,
-      scope: "user.info.basic,video.upload,video.publish",
-      response_type: "code",
-      redirect_uri: TIKTOK_REDIRECT,
-      state,
-    });
-  res.json({ authorize_url: url, state });
-});
-
-app.get("/auth/tiktok/start", (req, res) => {
-  const to = `${PUBLIC_BASE_URL}/auth/tiktok/connect`;
-  res.type("html").send(`
-    <script>
-      fetch('${to}')
-        .then(r => r.json())
-        .then(j => window.location.href = j.authorize_url)
-        .catch(e => document.body.innerText = 'err: '+ e);
-    </script>`);
-});
-
-// Callback: persist tokens, notify opener, close
-app.get("/auth/tiktok/callback", async (req, res) => {
-  const { code, error, error_description, state } = req.query;
-  if (error) {
-    return res
-      .status(400)
-      .type("html")
-      .send(`<pre>OAuth error: ${String(error_description || error)}</pre>`);
+    if (me.ok && me.json?.data?.user) {
+      const open_id = me.json.data.user.open_id;
+      TIKTOK_TOKENS = {
+        access_token: access,
+        refresh_token: tokenResp.json.refresh_token,
+        open_id,
+        scope: tokenResp.json.scope || "",
+      };
+      meInfo = { data: me.json.data.user };
+    } else {
+      meInfo = {
+        warn: "user.info returned non-JSON or error",
+        status: me.status,
+      };
+    }
   }
-  const tok = await tikTokToken({ code });
-  if (tok?.data?.access_token) saveTikTokAuth(tok.data);
 
-  // HTML posts a message back to opener (Base44) and closes
-  res.type("html").send(`
-    <html><body>
-      <script>
-        try {
-          window.opener && window.opener.postMessage(
-            { type: "tiktok_connected", ok: ${!!tok?.data?.access_token}, state: "${state||""}" },
-            "*"
-          );
-        } catch (e) {}
-        document.body.innerHTML = '<pre>TikTok Login OK</pre>';
-        setTimeout(() => window.close(), 300);
-      </script>
-    </body></html>
-  `);
+  // Enkel “OK” side (så du kan se hurtigt i browseren)
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(
+    `<h1>TikTok Login OK</h1>
+<pre>state: ${state}</pre>
+<pre>${JSON.stringify({ tokens: tokenResp.json || tokenResp.text, me: meInfo }, null, 2)}</pre>
+<small>Gem tokens i DB/session i stedet for at vise dem i produktion.</small>`
+  );
 });
 
-app.get("/auth/tiktok/status", (req, res) => {
+// simple kontoliste til UI (i sandbox har vi 1 bruger)
+app.get("/tiktok/accounts", (_req, res) => {
+  if (!TIKTOK_TOKENS?.open_id) return res.json({ ok: true, accounts: [] });
   res.json({
-    connected: !!tikTokAuth?.access_token,
-    open_id: tikTokAuth?.open_id || null,
-    expires_in: tikTokAuth?.expires_in || null,
-  });
-});
-
-app.get("/auth/tiktok/debug", (req, res) => {
-  res.json({
-    client_key_present: !!TIKTOK_CLIENT_KEY,
-    client_key_len: TIKTOK_CLIENT_KEY.length,
-    client_secret_present: !!TIKTOK_CLIENT_SECRET,
-    client_secret_len: TIKTOK_CLIENT_SECRET.length,
-    redirect_uri: TIKTOK_REDIRECT,
-    connected: !!tikTokAuth?.access_token,
-    open_id: tikTokAuth?.open_id || null,
-  });
-});
-
-// Accounts for UI dropdown (one sandbox account = open_id)
-app.get("/tiktok/accounts", (req, res) => {
-  if (!tikTokAuth?.open_id) return res.json({ accounts: [] });
-  res.json({
+    ok: true,
     accounts: [
-      {
-        id: tikTokAuth.open_id,
-        display_name: "Sandbox user",
-        type: "tiktok_sandbox",
-      },
+      { id: TIKTOK_TOKENS.open_id, label: `sandbox:${TIKTOK_TOKENS.open_id.slice(0, 6)}…` },
     ],
   });
 });
 
-// ---------- Jobs API ----------
-const requireApiKey = (req, res, next) => {
-  const key = req.get("x-api-key");
-  if (!API_KEY || key !== API_KEY) return res.status(401).json({ error: "unauthorized" });
-  next();
-};
+// ----------------- ROUTES: Jobs (Render + upload) -----------------
 
 app.post("/jobs", requireApiKey, async (req, res) => {
-  const { source_video_url, postToTikTok = false, tiktok_account_ids = [], caption } = req.body || {};
-  if (!source_video_url) return res.status(400).json({ error: "missing_source_video_url" });
-
-  const id = nowId("job");
-  jobs.set(id, { id, status: "downloading", created_at: Date.now() });
-  res.json({ ok: true, job_id: id }); // respond immediately
-
   try {
-    const inPath = await downloadToTmp(source_video_url);
-    jobs.get(id).status = "rendering";
+    const { source_video_url, postToTikTok = false, tiktok_account_ids = [] } = req.body || {};
 
-    const outPath = await runFFmpeg(inPath);
+    if (!source_video_url) return res.status(400).json({ error: "source_video_url_required" });
 
-    const destKey = `outputs/jobs/${id}/clip_${Date.now()}.mp4`;
-    const publicUrl = await uploadToSupabase(outPath, destKey);
-
-    jobs.set(id, {
-      ...jobs.get(id),
-      status: "done",
-      output_url: publicUrl,
-      caption: caption || null,
-    });
-
+    // hvis vi skal poste, kræv at OAuth er gennemført
     if (postToTikTok) {
-      if (!tikTokAuth?.access_token) {
-        jobs.get(id).tiktok = { posted: false, reason: "not_connected" };
-      } else {
-        jobs.get(id).tiktok = {
-          posted: false,
-          queued: true,
-          mode: "simulated_sandbox",
-          note:
-            "Real pull_by_url needs domain verification of the exact file host; marked as queued for demo.",
-          target_account: tiktok_account_ids?.[0] || tikTokAuth.open_id || null,
-          caption: caption || null,
-          video_url: publicUrl,
-        };
+      if (!TIKTOK_TOKENS?.access_token) {
+        return res.status(400).json({ error: "tiktok_not_connected" });
+      }
+      if (!Array.isArray(tiktok_account_ids) || tiktok_account_ids.length === 0) {
+        return res.status(400).json({ error: "tiktok_account_ids_required" });
       }
     }
 
-    try { await fsp.unlink(inPath); } catch {}
-    try { await fsp.unlink(outPath); } catch {}
+    const jobId = nowId("job");
+    // 1) download
+    const localIn = await downloadToTmp(source_video_url);
+    // 2) transcode
+    const localOut = await ffmpegTranscodeToVertical(localIn);
+    // 3) upload til supabase (public URL tilbage)
+    const publicUrl = await uploadToSupabase(localOut, jobId);
+
+    const payload = {
+      ok: true,
+      job_id: jobId,
+      output_url: publicUrl,
+      // NOTE: TikTok posting gøres i en særskilt knap/flow (ikke i dette endpoint)
+      note: postToTikTok
+        ? "Transcode ok. Post to TikTok via /tiktok/post (ikke implementeret i denne fil)."
+        : "Transcode ok.",
+    };
+
+    res.json(payload);
   } catch (e) {
-    jobs.set(id, { ...jobs.get(id), status: "error", error: String(e?.message || e) });
+    console.error(e);
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
-app.get("/jobs/:id", requireApiKey, (req, res) => {
-  const j = jobs.get(req.params.id);
-  if (!j) return res.status(404).json({ error: "not_found" });
-  res.json(j);
+// ----------------- ROUTES: Utility -----------------
+app.get("/", (_req, res) => {
+  res.type("text").send("✅ EuropePUSH backend up");
 });
 
-// ---------- Boot ----------
+app.use((req, res) => {
+  res.status(404).type("text").send(`Cannot ${req.method} ${req.path}`);
+});
+
+// ----------------- START -----------------
 app.listen(PORT, () => {
-  console.log("✅ Server on", PORT);
-  console.log("🔗 Base URL:", PUBLIC_BASE_URL);
-  console.log("🎥 VIDEO_JITTER:", VIDEO_JITTER);
+  console.log(`✅ Server on ${PORT}`);
+  console.log(`🔧 ENV SUPABASE_URL: ${SUPABASE_URL ? "present" : "missing"}`);
+  console.log(`🔧 ENV SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY ? "present" : "missing"}`);
+  console.log(`🔧 ENV API_KEY: ${API_KEY ? "present" : "missing"}`);
+  console.log(`🔧 TikTok keys: key=${TT_CLIENT_KEY ? "present" : "missing"} secret=${TT_CLIENT_SECRET ? "present" : "missing"}`);
+  console.log(`🔧 Redirect: ${TT_REDIRECT || "(missing)"}`);
+  console.log(`🔗 Connect URL: ${PUBLIC_BASE}/auth/tiktok/connect`);
 });
