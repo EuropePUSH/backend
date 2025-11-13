@@ -45,7 +45,7 @@ app.use((req, res, next) => {
   );
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") {
-    // preflight – her må den godt være 204, men KUN for OPTIONS
+    // Preflight
     return res.sendStatus(204);
   }
   next();
@@ -188,7 +188,6 @@ app.get("/health", (_req, res) => {
 // ----------------- TIKTOK OAUTH -----------------
 
 // Base44 kalder denne for at få auth-link
-// Håndter både GET og POST → så frontend er ligeglad
 app.all("/auth/tiktok/connect", (req, res) => {
   console.log("[/auth/tiktok/connect] method:", req.method);
 
@@ -202,7 +201,6 @@ app.all("/auth/tiktok/connect", (req, res) => {
   const url = buildTikTokAuthorizeURL();
   console.log("[/auth/tiktok/connect] authorize_url:", url);
 
-  // VIGTIGT: altid JSON + 200 (ingen 204 her)
   return res.status(200).json({
     ok: true,
     authorize_url: url,
@@ -301,10 +299,54 @@ app.get("/tiktok/accounts", (_req, res) => {
   });
 });
 
-// ----------------- JOBS -----------------
+// ----------------- JOB PROCESSOR (async) -----------------
+async function updateJob(jobId, patch) {
+  await supabase.from("jobs").update(patch).eq("job_id", jobId);
+}
+
+async function processJob(jobId, payload) {
+  try {
+    const { source_video_url } = payload;
+
+    await updateJob(jobId, { state: "processing", progress: 5 });
+
+    const localIn = await downloadToTmp(source_video_url);
+    await updateJob(jobId, { progress: 30 });
+
+    const localOut = await ffmpegTranscodeToVertical(localIn);
+    await updateJob(jobId, { progress: 70 });
+
+    const publicUrl = await uploadToSupabase(localOut, jobId);
+    await updateJob(jobId, { progress: 90 });
+
+    // gem output
+    await supabase.from("job_outputs").insert({
+      job_id: jobId,
+      idx: 0,
+      url: publicUrl,
+      caption: null,
+      hashtags: null,
+    });
+
+    await updateJob(jobId, { state: "completed", progress: 100 });
+    console.log("JOB_COMPLETED", jobId, publicUrl);
+  } catch (err) {
+    console.error("JOB_FAILED", jobId, err);
+    await updateJob(jobId, { state: "failed", progress: 100 });
+  }
+}
+
+// ----------------- JOBS API -----------------
+
+// Opret job – Base44 kalder den her
 app.post("/jobs", requireApiKey, async (req, res) => {
   try {
-    const { source_video_url, postToTikTok = false, tiktok_account_ids = [] } = req.body || {};
+    const {
+      source_video_url,
+      postToTikTok = false,
+      tiktok_account_ids = [],
+      ...rest
+    } = req.body || {};
 
     if (!source_video_url) {
       return res.status(400).json({ error: "source_video_url_required" });
@@ -321,17 +363,27 @@ app.post("/jobs", requireApiKey, async (req, res) => {
 
     const jobId = nowId("job");
 
-    const localIn = await downloadToTmp(source_video_url);
-    const localOut = await ffmpegTranscodeToVertical(localIn);
-    const publicUrl = await uploadToSupabase(localOut, jobId);
+    // 1) Opret job i DB med queued state
+    await supabase.from("jobs").insert({
+      job_id: jobId,
+      state: "queued",
+      progress: 0,
+      input: { source_video_url, postToTikTok, tiktok_account_ids, ...rest },
+    });
 
+    // 2) Start async processing (download + ffmpeg + upload)
+    processJob(jobId, { source_video_url, postToTikTok, tiktok_account_ids, ...rest }).catch(
+      (err) => {
+        console.error("processJob outer error", err);
+      }
+    );
+
+    // 3) Svar til klienten med det samme
     res.json({
       ok: true,
       job_id: jobId,
-      output_url: publicUrl,
-      note: postToTikTok
-        ? "Transcode ok. Post til TikTok kan bygges i et separat endpoint."
-        : "Transcode ok.",
+      state: "queued",
+      progress: 0,
     });
   } catch (e) {
     console.error(e);
@@ -339,7 +391,58 @@ app.post("/jobs", requireApiKey, async (req, res) => {
   }
 });
 
-// ----------------- MISC -----------------
+// Hent job-status – Base44 poller denne
+app.get("/jobs/:jobId", async (req, res) => {
+  const jobId = req.params.jobId;
+  try {
+    const { data: jobs, error: jobErr } = await supabase
+      .from("jobs")
+      .select("*")
+      .eq("job_id", jobId)
+      .limit(1);
+
+    if (jobErr) {
+      console.error("jobs select error", jobErr);
+      return res.status(500).json({ error: "db_error" });
+    }
+
+    const job = jobs?.[0];
+    if (!job) {
+      return res.status(404).json({ error: "job_not_found" });
+    }
+
+    const { data: outs, error: outErr } = await supabase
+      .from("job_outputs")
+      .select("*")
+      .eq("job_id", jobId)
+      .order("idx", { ascending: true });
+
+    if (outErr) {
+      console.error("job_outputs select error", outErr);
+    }
+
+    const outputs = (outs || []).map((o) => ({
+      idx: o.idx,
+      url: o.url,
+      caption: o.caption,
+      hashtags: o.hashtags,
+    }));
+
+    res.json({
+      ok: true,
+      job_id: job.job_id,
+      state: job.state,
+      progress: job.progress,
+      output_url: outputs[0]?.url || null,
+      outputs,
+    });
+  } catch (e) {
+    console.error("GET /jobs/:jobId error", e);
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+// ----------------- ROOT + 404 -----------------
 app.get("/", (_req, res) => {
   res.type("text").send("✅ EuropePUSH backend up");
 });
