@@ -211,9 +211,6 @@ app.post("/jobs", async (req, res) => {
         caption: caption || null,
         hashtags: hashtags || [],
       },
-      output: {
-        urls: [source_video_url],
-      },
     });
 
     if (jobErr) {
