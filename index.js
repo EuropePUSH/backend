@@ -3,11 +3,8 @@
 
 import express from "express";
 import fetch from "node-fetch";
-import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
-
-dotenv.config();
 
 // ---------- ENV ----------
 const PORT = process.env.PORT || 10000;
@@ -68,10 +65,6 @@ app.use((req, res, next) => {
 });
 
 // ---------- SMALL HELPERS ----------
-function log(...args) {
-  console.log(...args);
-}
-
 function randomState(prefix = "state_epush_") {
   return prefix + crypto.randomBytes(4).toString("hex");
 }
@@ -188,7 +181,7 @@ app.get("/auth/tiktok/callback", async (req, res) => {
       }
     }
 
-    // return simple debug page (what you already saw)
+    // return simple debug page
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(`
 <!doctype html>
@@ -290,9 +283,8 @@ app.post("/jobs", async (req, res) => {
       });
     }
 
-    // Build job payload
     const job_id = "job_" + crypto.randomBytes(4).toString("hex");
-    const state = "processing"; // or "queued"
+    const state = "processing";
     const progress = 0;
 
     const input = {
@@ -325,8 +317,6 @@ app.post("/jobs", async (req, res) => {
       });
     }
 
-    // **IMPORTANT PATCH**
-    // Return both top-level fields AND nested job for Base44
     const job = {
       job_id,
       state,
@@ -364,7 +354,6 @@ app.get("/jobs/:job_id", async (req, res) => {
       .single();
 
     if (error && error.code === "PGRST116") {
-      // not found
       return res.status(404).json({
         ok: false,
         error: "job_not_found",
@@ -373,7 +362,6 @@ app.get("/jobs/:job_id", async (req, res) => {
 
     if (error) throw error;
 
-    // shape expected by dashboard
     return res.json({
       ok: true,
       job: {
