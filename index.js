@@ -25,7 +25,6 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 
 const TT_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY || "";
 const TT_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || "";
-// Brug din verified redirect (fx https://api.europepush.com/auth/tiktok/callback)
 const TT_REDIRECT =
   process.env.TIKTOK_REDIRECT_URL ||
   "https://api.europepush.com/auth/tiktok/callback";
@@ -80,7 +79,7 @@ app.options("*", (req, res) => {
   return res.sendStatus(204);
 });
 
-// Helper: CORS headers på alle responses
+// CORS headers på alle responses
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (origin && allowedOrigins.includes(origin)) {
@@ -136,7 +135,6 @@ async function processJob(job_id, input) {
       throw new Error("missing_source_video_url");
     }
 
-    // 1) Download source
     console.log("Downloading video for job", job_id, "from", source_video_url);
     const resp = await fetch(source_video_url);
     if (!resp.ok) {
@@ -150,7 +148,6 @@ async function processJob(job_id, input) {
     await fs.writeFile(tmpIn, buf);
     console.log("Downloaded to file bytes:", buf.length);
 
-    // 2) FFMPEG transcode
     const ffArgs = [
       "-y",
       "-hide_banner",
@@ -209,7 +206,6 @@ async function processJob(job_id, input) {
       progress: 70,
     });
 
-    // 3) Upload til Supabase storage
     const fileBuf = await fs.readFile(tmpOut);
     const storagePath = `jobs/${job_id}/clip_${Date.now()}.mp4`;
 
@@ -240,13 +236,11 @@ async function processJob(job_id, input) {
       },
     ];
 
-    // 4) (OPTIONAL) TikTok upload - placeholder
     if (postToTikTok && Array.isArray(tiktok_account_ids) && tiktok_account_ids.length > 0) {
       console.log("Would post to TikTok accounts:", tiktok_account_ids);
-      // Her kan du senere lave rigtig upload til TikTok pr. account
+      // TODO: rigtig TikTok upload pr. account
     }
 
-    // 5) Markér job som færdigt
     await updateJobInDb(job_id, {
       state: "completed",
       progress: 100,
@@ -277,8 +271,6 @@ async function processJob(job_id, input) {
 }
 
 // ----------------- JOB ROUTES -----------------
-
-// Create job
 app.post("/jobs", requireApiKey, async (req, res) => {
   try {
     const {
@@ -329,7 +321,6 @@ app.post("/jobs", requireApiKey, async (req, res) => {
       });
     }
 
-    // Fire-and-forget worker
     processJob(job_id, input).catch((err) => {
       console.error("Background processJob crashed", job_id, err);
     });
@@ -349,7 +340,6 @@ app.post("/jobs", requireApiKey, async (req, res) => {
   }
 });
 
-// Get single job
 app.get("/jobs/:job_id", requireApiKey, async (req, res) => {
   const job_id = req.params.job_id;
   try {
@@ -394,8 +384,6 @@ app.get("/auth/tiktok/debug", (req, res) => {
 });
 
 // ----------------- TIKTOK AUTH FLOW -----------------
-
-// 1) Return authorize URL (til debug / tooling)
 app.get("/auth/tiktok/url", (req, res) => {
   if (!TT_CLIENT_KEY || !TT_REDIRECT) {
     return res.status(500).json({
@@ -416,7 +404,6 @@ app.get("/auth/tiktok/url", (req, res) => {
   res.json({ authorize_url });
 });
 
-// 2) Connect – redirect bruger til TikTok
 app.get("/auth/tiktok/connect", (req, res) => {
   if (!TT_CLIENT_KEY || !TT_REDIRECT) {
     return res
@@ -436,7 +423,6 @@ app.get("/auth/tiktok/connect", (req, res) => {
   return res.redirect(authorize_url);
 });
 
-// 3) Callback – exchange code for tokens + fetch user
 app.get("/auth/tiktok/callback", async (req, res) => {
   const { code, state } = req.query;
 
@@ -445,7 +431,6 @@ app.get("/auth/tiktok/callback", async (req, res) => {
   }
 
   try {
-    // Exchange code for tokens
     const tokenParams = new URLSearchParams({
       client_key: TT_CLIENT_KEY,
       client_secret: TT_CLIENT_SECRET,
@@ -480,7 +465,6 @@ app.get("/auth/tiktok/callback", async (req, res) => {
     const expiresIn = tokens.expires_in || 0;
     const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
 
-    // Fetch user info
     const meResp = await fetch(
       "https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name,avatar_url",
       {
@@ -509,7 +493,6 @@ app.get("/auth/tiktok/callback", async (req, res) => {
     const display_name = user.display_name || "TikTok User";
     const avatar_url = user.avatar_url || null;
 
-    // Gem tokens i tiktok_auth
     const { error: authError } = await supabase.from("tiktok_auth").upsert(
       {
         tiktok_open_id: open_id,
@@ -524,7 +507,6 @@ app.get("/auth/tiktok/callback", async (req, res) => {
       console.error("Supabase tiktok_auth upsert error:", authError);
     }
 
-    // Gem account i tiktok_accounts
     const { error: accError } = await supabase.from("tiktok_accounts").upsert(
       {
         tiktok_open_id: open_id,
@@ -538,7 +520,6 @@ app.get("/auth/tiktok/callback", async (req, res) => {
       console.error("Supabase tiktok_accounts upsert error:", accError);
     }
 
-    // Simpelt HTML svar til debug
     res.send(`
       <html>
         <body>
@@ -566,7 +547,6 @@ app.get("/auth/tiktok/callback", async (req, res) => {
   }
 });
 
-// 4) Status – bruges af Base44 til at vise om der er en konto
 app.get("/auth/tiktok/status", async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -598,19 +578,18 @@ app.get("/auth/tiktok/status", async (req, res) => {
   }
 });
 
-// 5) Accounts – liste over alle konti (til dropdown i UI)
+// 🔥 FIXED VERSION – no .order() here
 app.get("/tiktok/accounts", async (req, res) => {
   try {
     const { data, error } = await supabase
       .from("tiktok_accounts")
-      .select("id, tiktok_open_id, display_name, avatar_url")
-      .order("id", { ascending: true });
+      .select("id, tiktok_open_id, display_name, avatar_url");
 
     if (error) {
       console.error("Supabase tiktok_accounts list error:", error);
       return res
         .status(500)
-        .json({ ok: false, error: "supabase_error" });
+        .json({ ok: false, error: "supabase_error", detail: error.message });
     }
 
     return res.json({
