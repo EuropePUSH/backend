@@ -238,7 +238,7 @@ async function processJob(job_id, input) {
 
     if (postToTikTok && Array.isArray(tiktok_account_ids) && tiktok_account_ids.length > 0) {
       console.log("Would post to TikTok accounts:", tiktok_account_ids);
-      // TODO: rigtig TikTok upload pr. account
+      // TODO: rigtig TikTok upload pr. konto
     }
 
     await updateJobInDb(job_id, {
@@ -384,6 +384,8 @@ app.get("/auth/tiktok/debug", (req, res) => {
 });
 
 // ----------------- TIKTOK AUTH FLOW -----------------
+
+// Return JSON med authorize_url – brugt af Base44
 app.get("/auth/tiktok/url", (req, res) => {
   if (!TT_CLIENT_KEY || !TT_REDIRECT) {
     return res.status(500).json({
@@ -397,13 +399,14 @@ app.get("/auth/tiktok/url", (req, res) => {
     scope: "user.info.basic,video.upload,video.publish",
     response_type: "code",
     redirect_uri: TT_REDIRECT,
-    state: "state_epush_123",
+    state: "state_epush_" + crypto.randomBytes(4).toString("hex"),
   });
 
   const authorize_url = `https://www.tiktok.com/v2/auth/authorize/?${params.toString()}`;
-  res.json({ authorize_url });
+  res.json({ ok: true, authorize_url });
 });
 
+// Manual test-redirect (kan du bruge direkte i browser)
 app.get("/auth/tiktok/connect", (req, res) => {
   if (!TT_CLIENT_KEY || !TT_REDIRECT) {
     return res
@@ -423,6 +426,7 @@ app.get("/auth/tiktok/connect", (req, res) => {
   return res.redirect(authorize_url);
 });
 
+// Callback fra TikTok
 app.get("/auth/tiktok/callback", async (req, res) => {
   const { code, state } = req.query;
 
@@ -476,8 +480,10 @@ app.get("/auth/tiktok/callback", async (req, res) => {
 
     const me = await meResp.json();
 
-    if (me.error) {
+    if (me.error && me.error.code !== "ok") {
       console.error("TikTok user info error:", me);
+    } else {
+      console.log("TikTok user info:", me);
     }
 
     const user = me.data && me.data.user ? me.data.user : null;
@@ -493,27 +499,17 @@ app.get("/auth/tiktok/callback", async (req, res) => {
     const display_name = user.display_name || "TikTok User";
     const avatar_url = user.avatar_url || null;
 
-    const { error: authError } = await supabase.from("tiktok_auth").upsert(
+    // Gem ALT i tiktok_accounts (én tabel)
+    const { error: accError } = await supabase.from("tiktok_accounts").upsert(
       {
-        tiktok_open_id: open_id,
+        open_id,
+        display_name,
+        avatar_url,
         access_token: accessToken,
         refresh_token: refreshToken,
         expires_at: expiresAt,
       },
-      { onConflict: "tiktok_open_id" }
-    );
-
-    if (authError) {
-      console.error("Supabase tiktok_auth upsert error:", authError);
-    }
-
-    const { error: accError } = await supabase.from("tiktok_accounts").upsert(
-      {
-        tiktok_open_id: open_id,
-        display_name,
-        avatar_url,
-      },
-      { onConflict: "tiktok_open_id" }
+      { onConflict: "open_id" }
     );
 
     if (accError) {
@@ -547,11 +543,12 @@ app.get("/auth/tiktok/callback", async (req, res) => {
   }
 });
 
+// Status – bruger kun tiktok_accounts + open_id
 app.get("/auth/tiktok/status", async (req, res) => {
   try {
     const { data, error } = await supabase
       .from("tiktok_accounts")
-      .select("id, tiktok_open_id, display_name, avatar_url")
+      .select("id, open_id, display_name, avatar_url")
       .limit(1);
 
     if (error) {
@@ -578,16 +575,15 @@ app.get("/auth/tiktok/status", async (req, res) => {
   }
 });
 
-// 🔥 /tiktok/accounts – ALDRIG 500, altid 200
+// Liste kontoer – aldrig 500
 app.get("/tiktok/accounts", async (req, res) => {
   try {
     const { data, error } = await supabase
       .from("tiktok_accounts")
-      .select("id, tiktok_open_id, display_name, avatar_url");
+      .select("id, open_id, display_name, avatar_url");
 
     if (error) {
       console.error("Supabase tiktok_accounts list error:", error);
-      // Frontend skal ikke dø – vi returnerer bare tom liste
       return res.json({
         ok: true,
         accounts: [],
