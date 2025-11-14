@@ -9,7 +9,9 @@ import crypto from "crypto";
 // ---------- ENV ----------
 const PORT = process.env.PORT || 10000;
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Support both names so we don't break your existing Render env:
+const SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
 
 const TIKTOK_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY;
 const TIKTOK_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET;
@@ -19,11 +21,9 @@ const TIKTOK_REDIRECT_URI =
   "https://api.europepush.com/auth/tiktok/callback";
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("❌ Missing Supabase env vars");
-}
-
-if (!TIKTOK_CLIENT_KEY || !TIKTOK_CLIENT_SECRET) {
-  console.warn("⚠️ TikTok env vars missing – TikTok features will not work");
+  console.error("❌ Missing Supabase env vars (SUPABASE_URL / SUPABASE_SERVICE_KEY)");
+  // Stop here so Render ikke prøver at køre uden DB
+  process.exit(1);
 }
 
 // ---------- SUPABASE ----------
