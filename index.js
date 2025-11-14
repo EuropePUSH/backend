@@ -578,7 +578,7 @@ app.get("/auth/tiktok/status", async (req, res) => {
   }
 });
 
-// 🔥 FIXED VERSION – no .order() here
+// 🔥 /tiktok/accounts – ALDRIG 500, altid 200
 app.get("/tiktok/accounts", async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -587,9 +587,12 @@ app.get("/tiktok/accounts", async (req, res) => {
 
     if (error) {
       console.error("Supabase tiktok_accounts list error:", error);
-      return res
-        .status(500)
-        .json({ ok: false, error: "supabase_error", detail: error.message });
+      // Frontend skal ikke dø – vi returnerer bare tom liste
+      return res.json({
+        ok: true,
+        accounts: [],
+        debug_error: error.message || String(error),
+      });
     }
 
     return res.json({
@@ -598,9 +601,11 @@ app.get("/tiktok/accounts", async (req, res) => {
     });
   } catch (err) {
     console.error("GET /tiktok/accounts error:", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: "internal_error", detail: String(err) });
+    return res.json({
+      ok: true,
+      accounts: [],
+      debug_error: String(err),
+    });
   }
 });
 
