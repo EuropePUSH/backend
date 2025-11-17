@@ -1,4 +1,4 @@
-// index.js (ESM)
+// index.js (ESM, patched)
 
 import express from "express";
 import cors from "cors";
@@ -47,47 +47,31 @@ const allowedOrigins = [
   "http://localhost:5173",
 ];
 
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true);
-      if (allowedOrigins.includes(origin)) return cb(null, true);
-      return cb(null, false);
-    },
-    credentials: true,
-  })
-);
+// PATCH: simple CORS debug logger
+app.use((req, res, next) => {
+  const origin = req.headers.origin || "NO_ORIGIN";
+  console.log(`[CORS] Origin: ${origin}  Path: ${req.method} ${req.path}`);
+  next();
+});
+
+// PATCH: unified CORS handling
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // e.g. curl / server-to-server
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    // Not allowed origin – no CORS headers → browser blokker selv
+    return cb(null, false);
+  },
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
+
+// PATCH: let cors handle all preflight OPTIONS
+app.options("*", cors(corsOptions));
 
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
-
-// Preflight
-app.options("*", (req, res) => {
-  const origin = req.headers.origin;
-  if (origin && allowedOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader(
-      "Access-Control-Allow-Methods",
-      "GET,POST,PUT,DELETE,OPTIONS"
-    );
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Content-Type, x-api-key"
-    );
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-  }
-  return res.sendStatus(204);
-});
-
-// CORS headers på alle responses
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && allowedOrigins.includes(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-  }
-  next();
-});
 
 // ----------------- AUTH MIDDLEWARE -----------------
 function requireApiKey(req, res, next) {
@@ -407,6 +391,7 @@ app.get("/auth/tiktok/url", (req, res) => {
 });
 
 // Manual test-redirect (kan du bruge direkte i browser)
+// NOTE: Denne route er tænkt til normal browser-navigation (href), ikke fetch.
 app.get("/auth/tiktok/connect", (req, res) => {
   if (!TT_CLIENT_KEY || !TT_REDIRECT) {
     return res
@@ -423,6 +408,7 @@ app.get("/auth/tiktok/connect", (req, res) => {
   });
 
   const authorize_url = `https://www.tiktok.com/v2/auth/authorize/?${params.toString()}`;
+
   return res.redirect(authorize_url);
 });
 
