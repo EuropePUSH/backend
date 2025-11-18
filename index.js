@@ -1,4 +1,4 @@
-// index.js (ESM, Europepush backend + TikTok uploader, TikTok-optimized encode)
+// index.js (ESM, Europepush backend + TikTok uploader, TikTok-optimized encode + ekstra debug)
 
 import express from "express";
 import cors from "cors";
@@ -38,7 +38,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // ----------------- EXPRESS APP -----------------
 const app = express();
-const BACKEND_VERSION = "2025-11-18-tiktok-uploader-v3";
+const BACKEND_VERSION = "2025-11-18-tiktok-uploader-v4-debug";
 
 console.log("🚀 Europepush backend starting, version:", BACKEND_VERSION);
 
@@ -59,7 +59,7 @@ app.use((req, res, next) => {
 
 const corsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // fx curl / server-to-server
+    if (!origin) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
     return cb(null, false);
   },
@@ -93,6 +93,7 @@ function requireApiKey(req, res, next) {
 
 // ----------------- SUPABASE HELPERS -----------------
 async function updateJobInDb(job_id, patch) {
+  console.log("[JOB]", job_id, "updateJobInDb patch:", patch);
   const { error } = await supabase
     .from("jobs")
     .update(patch)
@@ -104,13 +105,6 @@ async function updateJobInDb(job_id, patch) {
 }
 
 // ----------------- TIKTOK HELPERS -----------------
-
-/**
- * Upload video til TikTok Inbox (draft) via PULL_FROM_URL.
- * Kræver:
- *  - accessToken: TikTok user access token med video.upload scope
- *  - videoUrl: offentlig tilgængelig URL (domæne skal være verificeret i TikTok)
- */
 async function uploadVideoToTikTokInbox(accessToken, videoUrl) {
   const endpoint =
     "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/";
@@ -121,6 +115,8 @@ async function uploadVideoToTikTokInbox(accessToken, videoUrl) {
       video_url: videoUrl,
     },
   };
+
+  console.log("[TikTok] Calling inbox upload with URL:", videoUrl);
 
   const resp = await fetch(endpoint, {
     method: "POST",
@@ -136,16 +132,19 @@ async function uploadVideoToTikTokInbox(accessToken, videoUrl) {
   if (!resp.ok) {
     const code = json?.error?.code || resp.status;
     const msg = json?.error?.message || resp.statusText;
+    console.error("[TikTok] HTTP error:", code, msg, json);
     throw new Error(`tiktok_upload_http_error: ${code} ${msg}`);
   }
 
   if (!json || !json.error || json.error.code !== "ok") {
     const code = json?.error?.code || "unknown";
     const msg = json?.error?.message || "unknown";
+    console.error("[TikTok] API error:", code, msg, json);
     throw new Error(`tiktok_upload_error: ${code} ${msg}`);
   }
 
   if (!json.data || !json.data.publish_id) {
+    console.error("[TikTok] Missing publish_id in response:", json);
     throw new Error("tiktok_upload_missing_publish_id");
   }
 
@@ -164,6 +163,8 @@ async function processJob(job_id, input) {
   let tmpIn = null;
   let tmpOut = null;
 
+  console.log("[JOB]", job_id, "processJob start, input:", input);
+
   try {
     const {
       source_video_url,
@@ -177,7 +178,18 @@ async function processJob(job_id, input) {
       throw new Error("missing_source_video_url");
     }
 
-    console.log("Downloading video for job", job_id, "from", source_video_url);
+    // Progress 10 – vi har accepteret jobbet
+    await updateJobInDb(job_id, {
+      state: "processing",
+      progress: 10,
+    });
+
+    console.log(
+      "[JOB]",
+      job_id,
+      "Downloading video from",
+      source_video_url
+    );
     const resp = await fetch(source_video_url);
     if (!resp.ok) {
       throw new Error(`download_failed_status_${resp.status}`);
@@ -188,14 +200,9 @@ async function processJob(job_id, input) {
     tmpIn = path.join(os.tmpdir(), `in_${job_id}.mp4`);
     tmpOut = path.join(os.tmpdir(), `out_${job_id}.mp4`);
     await fs.writeFile(tmpIn, buf);
-    console.log("Downloaded to file bytes:", buf.length);
+    console.log("[JOB]", job_id, "Downloaded file bytes:", buf.length);
 
-    // ----------------- TIKTOK-OPTIMIZED FFmpeg PIPELINE -----------------
-    // Fokus: høj kvalitet, mindre "template"-agtig encode, undgå overkompression
-    // - Beholder input fps (ingen -r 30) → ser mere "naturlig" ud
-    // - Skaler/pad til 1080x1920 med god filter (lanczos)
-    // - Fornuftig CRF og preset til TikTok
-    // - Re-encoder audio til standard AAC 128k
+    // ----------------- FFmpeg -----------------
     const ffArgs = [
       "-y",
       "-hide_banner",
@@ -227,19 +234,34 @@ async function processJob(job_id, input) {
       tmpOut,
     ];
 
-    console.log("FFmpeg args:", ffArgs.join(" "));
+    console.log("[JOB]", job_id, "FFmpeg args:", ffArgs.join(" "));
     await execa(ffmpegBin, ffArgs, {
       stdout: process.stdout,
       stderr: process.stderr,
     });
 
+    console.log("[JOB]", job_id, "FFmpeg completed");
+
+    // Progress 40 – encode færdig
     await updateJobInDb(job_id, {
       state: "processing",
-      progress: 70,
+      progress: 40,
     });
 
+    // ----------------- READ OUTPUT FILE -----------------
+    console.log("[JOB]", job_id, "Reading encoded file");
     const fileBuf = await fs.readFile(tmpOut);
+    console.log("[JOB]", job_id, "Encoded file size:", fileBuf.length);
+
+    // Progress 60 – ved at uploade til Supabase
+    await updateJobInDb(job_id, {
+      state: "processing",
+      progress: 60,
+    });
+
+    // ----------------- SUPABASE STORAGE UPLOAD -----------------
     const storagePath = `jobs/${job_id}/clip_${Date.now()}.mp4`;
+    console.log("[JOB]", job_id, "Uploading to Supabase at", storagePath);
 
     const upload = await supabase.storage
       .from("outputs")
@@ -249,6 +271,7 @@ async function processJob(job_id, input) {
       });
 
     if (upload.error) {
+      console.error("[JOB]", job_id, "Supabase upload error:", upload.error);
       throw new Error(`supabase_upload_failed: ${upload.error.message}`);
     }
 
@@ -257,7 +280,13 @@ async function processJob(job_id, input) {
       .getPublicUrl(storagePath);
 
     const outputUrl = publicUrlData.publicUrl;
-    console.log("UPLOAD_OK job:", job_id, "url:", outputUrl);
+    console.log("[JOB]", job_id, "UPLOAD_OK, public URL:", outputUrl);
+
+    // Progress 70 – video klar i storage
+    await updateJobInDb(job_id, {
+      state: "processing",
+      progress: 70,
+    });
 
     let outputs = [
       {
@@ -277,22 +306,28 @@ async function processJob(job_id, input) {
       tiktok_account_ids.length > 0
     ) {
       console.log(
-        "TikTok upload requested for job",
+        "[JOB]",
         job_id,
-        "accounts:",
+        "TikTok upload requested for accounts:",
         tiktok_account_ids
       );
 
-      // Vi forventer her, at tiktok_account_ids indeholder tiktok_accounts.id (hos dig = open_id)
       const { data: accounts, error: accError } = await supabase
         .from("tiktok_accounts")
         .select("id, open_id, access_token, tokens, profile")
         .in("id", tiktok_account_ids);
 
       if (accError) {
-        console.error("Supabase tiktok_accounts fetch error:", accError);
+        console.error(
+          "[JOB]",
+          job_id,
+          "Supabase tiktok_accounts fetch error:",
+          accError
+        );
       } else if (!accounts || accounts.length === 0) {
         console.warn(
+          "[JOB]",
+          job_id,
           "No matching TikTok accounts found for ids:",
           tiktok_account_ids
         );
@@ -324,10 +359,9 @@ async function processJob(job_id, input) {
             );
 
             console.log(
-              "TikTok upload OK",
-              "job:",
+              "[JOB]",
               job_id,
-              "account_id:",
+              "TikTok upload OK for account:",
               acc.id,
               "open_id:",
               openId,
@@ -343,10 +377,9 @@ async function processJob(job_id, input) {
             });
           } catch (err) {
             console.error(
-              "TikTok upload failed",
-              "job:",
+              "[JOB]",
               job_id,
-              "account_id:",
+              "TikTok upload failed for account:",
               acc.id,
               "open_id:",
               acc.open_id,
@@ -367,6 +400,13 @@ async function processJob(job_id, input) {
 
     outputs[0].tiktok = tiktok_results;
 
+    // Progress 90 – alt output samlet
+    await updateJobInDb(job_id, {
+      state: "processing",
+      progress: 90,
+    });
+
+    // ----------------- MARK COMPLETED -----------------
     await updateJobInDb(job_id, {
       state: "completed",
       progress: 100,
@@ -374,9 +414,9 @@ async function processJob(job_id, input) {
       error_message: null,
     });
 
-    console.log("Job completed:", job_id);
+    console.log("[JOB]", job_id, "Job completed");
   } catch (err) {
-    console.error("Job worker failed", job_id, err);
+    console.error("[JOB]", job_id, "Job worker failed:", err);
     try {
       await updateJobInDb(job_id, {
         state: "failed",
@@ -384,7 +424,12 @@ async function processJob(job_id, input) {
         error_message: err.message || String(err),
       });
     } catch (e2) {
-      console.error("Also failed to mark job failed in DB", e2);
+      console.error(
+        "[JOB]",
+        job_id,
+        "Also failed to mark job failed in DB:",
+        e2
+      );
     }
   } finally {
     if (tmpIn) {
@@ -422,6 +467,8 @@ app.post("/jobs", requireApiKey, async (req, res) => {
       postToTikTok,
       tiktok_account_ids,
     };
+
+    console.log("[JOB]", job_id, "POST /jobs input:", input);
 
     const { data, error } = await supabase
       .from("jobs")
@@ -511,7 +558,6 @@ app.get("/auth/tiktok/debug", (req, res) => {
 
 // ----------------- TIKTOK AUTH FLOW -----------------
 
-// Return JSON med authorize_url – brugt af frontend
 app.get("/auth/tiktok/url", (req, res) => {
   if (!TT_CLIENT_KEY || !TT_REDIRECT) {
     return res.status(500).json({
@@ -532,7 +578,7 @@ app.get("/auth/tiktok/url", (req, res) => {
   res.json({ ok: true, authorize_url });
 });
 
-// Manual test-redirect – brug i browser, ikke via fetch
+// Manual test-redirect
 app.get("/auth/tiktok/connect", (req, res) => {
   if (!TT_CLIENT_KEY || !TT_REDIRECT) {
     return res
@@ -627,15 +673,15 @@ app.get("/auth/tiktok/callback", async (req, res) => {
     const avatar_url = user.avatar_url || null;
 
     const upsertPayload = {
-      id: open_id, // id = open_id (matcher din nuværende række)
+      id: open_id,
       open_id,
       display_name,
       avatar_url,
       access_token: accessToken,
       refresh_token: refreshToken,
       expires_at: expiresAt,
-      tokens, // raw token JSON
-      profile: me, // raw profile JSON
+      tokens,
+      profile: me,
     };
 
     const { error: accError } = await supabase
@@ -673,7 +719,7 @@ app.get("/auth/tiktok/callback", async (req, res) => {
   }
 });
 
-// Status – bruger kun tiktok_accounts + open_id
+// Status
 app.get("/auth/tiktok/status", async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -705,7 +751,7 @@ app.get("/auth/tiktok/status", async (req, res) => {
   }
 });
 
-// Liste kontoer – aldrig 500
+// Liste kontoer
 app.get("/tiktok/accounts", async (req, res) => {
   try {
     const { data, error } = await supabase
