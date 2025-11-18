@@ -1,4 +1,4 @@
-// index.js (ESM, Europepush backend + TikTok uploader)
+// index.js (ESM, Europepush backend + TikTok uploader, TikTok-optimized encode)
 
 import express from "express";
 import cors from "cors";
@@ -38,7 +38,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // ----------------- EXPRESS APP -----------------
 const app = express();
-const BACKEND_VERSION = "2025-11-18-tiktok-uploader-v2";
+const BACKEND_VERSION = "2025-11-18-tiktok-uploader-v3";
 
 console.log("🚀 Europepush backend starting, version:", BACKEND_VERSION);
 
@@ -93,7 +93,10 @@ function requireApiKey(req, res, next) {
 
 // ----------------- SUPABASE HELPERS -----------------
 async function updateJobInDb(job_id, patch) {
-  const { error } = await supabase.from("jobs").update(patch).eq("job_id", job_id);
+  const { error } = await supabase
+    .from("jobs")
+    .update(patch)
+    .eq("job_id", job_id);
   if (error) {
     console.error("Supabase update job error:", error);
     throw error;
@@ -187,26 +190,22 @@ async function processJob(job_id, input) {
     await fs.writeFile(tmpIn, buf);
     console.log("Downloaded to file bytes:", buf.length);
 
+    // ----------------- TIKTOK-OPTIMIZED FFmpeg PIPELINE -----------------
+    // Fokus: høj kvalitet, mindre "template"-agtig encode, undgå overkompression
+    // - Beholder input fps (ingen -r 30) → ser mere "naturlig" ud
+    // - Skaler/pad til 1080x1920 med god filter (lanczos)
+    // - Fornuftig CRF og preset til TikTok
+    // - Re-encoder audio til standard AAC 128k
     const ffArgs = [
       "-y",
       "-hide_banner",
       "-nostdin",
       "-threads",
-      "1",
-      "-filter_threads",
-      "1",
-      "-filter_complex_threads",
-      "1",
+      "2",
       "-i",
       tmpIn,
       "-vf",
-      "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad=1080:1920:(1080-iw*min(1080/iw\\,1920/ih))/2:(1920-ih*min(1080/iw\\,1920/ih))/2,crop=1080-4:1920-4:2:2,pad=1080:1920:(1080-iw)/2:(1920-ih)/2",
-      "-r",
-      "30",
-      "-map",
-      "0:v:0",
-      "-map",
-      "0:a:0",
+      "scale=w=1080:h=1920:force_original_aspect_ratio=decrease:flags=lanczos,pad=1080:1920:(1080-iw)/2:(1920-ih)/2",
       "-c:v",
       "libx264",
       "-profile:v",
@@ -214,21 +213,15 @@ async function processJob(job_id, input) {
       "-pix_fmt",
       "yuv420p",
       "-preset",
-      "ultrafast",
+      "medium",
       "-crf",
-      "21",
-      "-tune",
-      "fastdecode",
-      "-x264-params",
-      "ref=1:bframes=2:rc-lookahead=8:keyint=120:min-keyint=24:scenecut=0",
-      "-maxrate",
-      "3500k",
-      "-bufsize",
-      "7000k",
-      "-max_muxing_queue_size",
-      "1024",
+      "19",
+      "-metadata",
+      "title=Europepush ContentMølle Export",
       "-c:a",
-      "copy",
+      "aac",
+      "-b:a",
+      "128k",
       "-movflags",
       "+faststart",
       tmpOut,
@@ -278,7 +271,11 @@ async function processJob(job_id, input) {
     // ----------------- TIKTOK UPLOAD (INBOX) -----------------
     let tiktok_results = [];
 
-    if (postToTikTok && Array.isArray(tiktok_account_ids) && tiktok_account_ids.length > 0) {
+    if (
+      postToTikTok &&
+      Array.isArray(tiktok_account_ids) &&
+      tiktok_account_ids.length > 0
+    ) {
       console.log(
         "TikTok upload requested for job",
         job_id,
@@ -286,7 +283,7 @@ async function processJob(job_id, input) {
         tiktok_account_ids
       );
 
-      // Vi forventer her, at tiktok_account_ids indeholder tiktok_accounts.id
+      // Vi forventer her, at tiktok_account_ids indeholder tiktok_accounts.id (hos dig = open_id)
       const { data: accounts, error: accError } = await supabase
         .from("tiktok_accounts")
         .select("id, open_id, access_token, tokens, profile")
@@ -302,18 +299,15 @@ async function processJob(job_id, input) {
       } else {
         for (const acc of accounts) {
           try {
-            // tokens + profile er jsonb felter med hele TikTok-responsen
             const tokensJson = acc.tokens || {};
             const profileJson = acc.profile || {};
 
-            // access token – først prøver vi json, derefter kolonnen
             const accessToken =
               tokensJson.access_token ||
               tokensJson.accessToken ||
               acc.access_token ||
               null;
 
-            // open_id – først fra profile.data.user.open_id, så tokens, så kolonne, så id
             const openId =
               profileJson?.data?.user?.open_id ||
               tokensJson.open_id ||
@@ -371,7 +365,6 @@ async function processJob(job_id, input) {
       }
     }
 
-    // Fold TikTok-resultater ind i outputs[0]
     outputs[0].tiktok = tiktok_results;
 
     await updateJobInDb(job_id, {
@@ -633,17 +626,16 @@ app.get("/auth/tiktok/callback", async (req, res) => {
     const display_name = user.display_name || "TikTok User";
     const avatar_url = user.avatar_url || null;
 
-    // Gem både kolonnefelter og raw tokens/profil hvis tabellen har dem
     const upsertPayload = {
-      id: open_id, // så id = open_id (matcher din nuværende række)
+      id: open_id, // id = open_id (matcher din nuværende række)
       open_id,
       display_name,
       avatar_url,
       access_token: accessToken,
       refresh_token: refreshToken,
       expires_at: expiresAt,
-      tokens, // jsonb
-      profile: me, // jsonb
+      tokens, // raw token JSON
+      profile: me, // raw profile JSON
     };
 
     const { error: accError } = await supabase
