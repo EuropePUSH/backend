@@ -1,4 +1,4 @@
-// index.js (ESM, with TikTok uploader)
+// index.js (ESM, Europepush backend + TikTok uploader)
 
 import express from "express";
 import cors from "cors";
@@ -38,6 +38,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // ----------------- EXPRESS APP -----------------
 const app = express();
+const BACKEND_VERSION = "2025-11-18-tiktok-uploader-v2";
+
+console.log("🚀 Europepush backend starting, version:", BACKEND_VERSION);
 
 const allowedOrigins = [
   "https://europepush.com",
@@ -47,7 +50,7 @@ const allowedOrigins = [
   "http://localhost:5173",
 ];
 
-// CORS debug (optional men nice når du fejlsøger)
+// CORS debug
 app.use((req, res, next) => {
   const origin = req.headers.origin || "NO_ORIGIN";
   console.log(`[CORS] Origin: ${origin}  Path: ${req.method} ${req.path}`);
@@ -68,6 +71,11 @@ app.options("*", cors(corsOptions));
 
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true }));
+
+// ----------------- SIMPLE DEBUG VERSION -----------------
+app.get("/debug/version", (req, res) => {
+  res.json({ ok: true, version: BACKEND_VERSION });
+});
 
 // ----------------- AUTH MIDDLEWARE -----------------
 function requireApiKey(req, res, next) {
@@ -99,11 +107,6 @@ async function updateJobInDb(job_id, patch) {
  * Kræver:
  *  - accessToken: TikTok user access token med video.upload scope
  *  - videoUrl: offentlig tilgængelig URL (domæne skal være verificeret i TikTok)
- *
- * Returnerer fx:
- *  {
- *    publish_id: "v_inbox_file~v2.123456789"
- *  }
  */
 async function uploadVideoToTikTokInbox(accessToken, videoUrl) {
   const endpoint =
@@ -283,9 +286,10 @@ async function processJob(job_id, input) {
         tiktok_account_ids
       );
 
+      // Vi forventer her, at tiktok_account_ids indeholder tiktok_accounts.id
       const { data: accounts, error: accError } = await supabase
         .from("tiktok_accounts")
-        .select("id, open_id, access_token")
+        .select("id, open_id, access_token, tokens, profile")
         .in("id", tiktok_account_ids);
 
       if (accError) {
@@ -298,12 +302,30 @@ async function processJob(job_id, input) {
       } else {
         for (const acc of accounts) {
           try {
-            if (!acc.access_token) {
+            // tokens + profile er jsonb felter med hele TikTok-responsen
+            const tokensJson = acc.tokens || {};
+            const profileJson = acc.profile || {};
+
+            // access token – først prøver vi json, derefter kolonnen
+            const accessToken =
+              tokensJson.access_token ||
+              tokensJson.accessToken ||
+              acc.access_token ||
+              null;
+
+            // open_id – først fra profile.data.user.open_id, så tokens, så kolonne, så id
+            const openId =
+              profileJson?.data?.user?.open_id ||
+              tokensJson.open_id ||
+              acc.open_id ||
+              acc.id;
+
+            if (!accessToken) {
               throw new Error("missing_access_token_for_account");
             }
 
             const result = await uploadVideoToTikTokInbox(
-              acc.access_token,
+              accessToken,
               outputUrl
             );
 
@@ -314,14 +336,14 @@ async function processJob(job_id, input) {
               "account_id:",
               acc.id,
               "open_id:",
-              acc.open_id,
+              openId,
               "publish_id:",
               result.publish_id
             );
 
             tiktok_results.push({
               account_id: acc.id,
-              open_id: acc.open_id,
+              open_id: openId,
               publish_id: result.publish_id,
               status: "ok",
             });
@@ -339,7 +361,7 @@ async function processJob(job_id, input) {
 
             tiktok_results.push({
               account_id: acc.id,
-              open_id: acc.open_id,
+              open_id: acc.open_id || null,
               publish_id: null,
               status: "error",
               error_message: err.message || String(err),
@@ -349,7 +371,7 @@ async function processJob(job_id, input) {
       }
     }
 
-    // Fold TikTok-resultater ind i outputs[0], så frontend kan læse dem
+    // Fold TikTok-resultater ind i outputs[0]
     outputs[0].tiktok = tiktok_results;
 
     await updateJobInDb(job_id, {
@@ -611,17 +633,22 @@ app.get("/auth/tiktok/callback", async (req, res) => {
     const display_name = user.display_name || "TikTok User";
     const avatar_url = user.avatar_url || null;
 
-    const { error: accError } = await supabase.from("tiktok_accounts").upsert(
-      {
-        open_id,
-        display_name,
-        avatar_url,
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        expires_at: expiresAt,
-      },
-      { onConflict: "open_id" }
-    );
+    // Gem både kolonnefelter og raw tokens/profil hvis tabellen har dem
+    const upsertPayload = {
+      id: open_id, // så id = open_id (matcher din nuværende række)
+      open_id,
+      display_name,
+      avatar_url,
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      expires_at: expiresAt,
+      tokens, // jsonb
+      profile: me, // jsonb
+    };
+
+    const { error: accError } = await supabase
+      .from("tiktok_accounts")
+      .upsert(upsertPayload, { onConflict: "id" });
 
     if (accError) {
       console.error("Supabase tiktok_accounts upsert error:", accError);
@@ -644,7 +671,7 @@ app.get("/auth/tiktok/callback", async (req, res) => {
             null,
             2
           )}</pre>
-          <p>Gem tokens i DB/session i stedet for at vise dem i produktion.</p>
+          <p>Tokens are stored in the database. You can now close this window.</p>
         </body>
       </html>
     `);
