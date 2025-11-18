@@ -1,4 +1,4 @@
-// index.js (ESM, patched)
+// index.js (ESM, with TikTok uploader)
 
 import express from "express";
 import cors from "cors";
@@ -47,27 +47,23 @@ const allowedOrigins = [
   "http://localhost:5173",
 ];
 
-// PATCH: simple CORS debug logger
+// CORS debug (optional men nice når du fejlsøger)
 app.use((req, res, next) => {
   const origin = req.headers.origin || "NO_ORIGIN";
   console.log(`[CORS] Origin: ${origin}  Path: ${req.method} ${req.path}`);
   next();
 });
 
-// PATCH: unified CORS handling
 const corsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // e.g. curl / server-to-server
+    if (!origin) return cb(null, true); // fx curl / server-to-server
     if (allowedOrigins.includes(origin)) return cb(null, true);
-    // Not allowed origin – no CORS headers → browser blokker selv
     return cb(null, false);
   },
   credentials: true,
 };
 
 app.use(cors(corsOptions));
-
-// PATCH: let cors handle all preflight OPTIONS
 app.options("*", cors(corsOptions));
 
 app.use(express.json({ limit: "20mb" }));
@@ -94,6 +90,62 @@ async function updateJobInDb(job_id, patch) {
     console.error("Supabase update job error:", error);
     throw error;
   }
+}
+
+// ----------------- TIKTOK HELPERS -----------------
+
+/**
+ * Upload video til TikTok Inbox (draft) via PULL_FROM_URL.
+ * Kræver:
+ *  - accessToken: TikTok user access token med video.upload scope
+ *  - videoUrl: offentlig tilgængelig URL (domæne skal være verificeret i TikTok)
+ *
+ * Returnerer fx:
+ *  {
+ *    publish_id: "v_inbox_file~v2.123456789"
+ *  }
+ */
+async function uploadVideoToTikTokInbox(accessToken, videoUrl) {
+  const endpoint =
+    "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/";
+
+  const body = {
+    source_info: {
+      source: "PULL_FROM_URL",
+      video_url: videoUrl,
+    },
+  };
+
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json; charset=UTF-8",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const json = await resp.json().catch(() => ({}));
+
+  if (!resp.ok) {
+    const code = json?.error?.code || resp.status;
+    const msg = json?.error?.message || resp.statusText;
+    throw new Error(`tiktok_upload_http_error: ${code} ${msg}`);
+  }
+
+  if (!json || !json.error || json.error.code !== "ok") {
+    const code = json?.error?.code || "unknown";
+    const msg = json?.error?.message || "unknown";
+    throw new Error(`tiktok_upload_error: ${code} ${msg}`);
+  }
+
+  if (!json.data || !json.data.publish_id) {
+    throw new Error("tiktok_upload_missing_publish_id");
+  }
+
+  return {
+    publish_id: json.data.publish_id,
+  };
 }
 
 // ----------------- HEALTH -----------------
@@ -220,10 +272,85 @@ async function processJob(job_id, input) {
       },
     ];
 
+    // ----------------- TIKTOK UPLOAD (INBOX) -----------------
+    let tiktok_results = [];
+
     if (postToTikTok && Array.isArray(tiktok_account_ids) && tiktok_account_ids.length > 0) {
-      console.log("Would post to TikTok accounts:", tiktok_account_ids);
-      // TODO: rigtig TikTok upload pr. konto
+      console.log(
+        "TikTok upload requested for job",
+        job_id,
+        "accounts:",
+        tiktok_account_ids
+      );
+
+      const { data: accounts, error: accError } = await supabase
+        .from("tiktok_accounts")
+        .select("id, open_id, access_token")
+        .in("id", tiktok_account_ids);
+
+      if (accError) {
+        console.error("Supabase tiktok_accounts fetch error:", accError);
+      } else if (!accounts || accounts.length === 0) {
+        console.warn(
+          "No matching TikTok accounts found for ids:",
+          tiktok_account_ids
+        );
+      } else {
+        for (const acc of accounts) {
+          try {
+            if (!acc.access_token) {
+              throw new Error("missing_access_token_for_account");
+            }
+
+            const result = await uploadVideoToTikTokInbox(
+              acc.access_token,
+              outputUrl
+            );
+
+            console.log(
+              "TikTok upload OK",
+              "job:",
+              job_id,
+              "account_id:",
+              acc.id,
+              "open_id:",
+              acc.open_id,
+              "publish_id:",
+              result.publish_id
+            );
+
+            tiktok_results.push({
+              account_id: acc.id,
+              open_id: acc.open_id,
+              publish_id: result.publish_id,
+              status: "ok",
+            });
+          } catch (err) {
+            console.error(
+              "TikTok upload failed",
+              "job:",
+              job_id,
+              "account_id:",
+              acc.id,
+              "open_id:",
+              acc.open_id,
+              err
+            );
+
+            tiktok_results.push({
+              account_id: acc.id,
+              open_id: acc.open_id,
+              publish_id: null,
+              status: "error",
+              error_message: err.message || String(err),
+            });
+          }
+        }
+      }
     }
+
+    // Fold TikTok-resultater ind i outputs[0], så frontend kan læse dem
+    outputs[0].tiktok = tiktok_results;
 
     await updateJobInDb(job_id, {
       state: "completed",
@@ -369,7 +496,7 @@ app.get("/auth/tiktok/debug", (req, res) => {
 
 // ----------------- TIKTOK AUTH FLOW -----------------
 
-// Return JSON med authorize_url – brugt af Base44
+// Return JSON med authorize_url – brugt af frontend
 app.get("/auth/tiktok/url", (req, res) => {
   if (!TT_CLIENT_KEY || !TT_REDIRECT) {
     return res.status(500).json({
@@ -390,8 +517,7 @@ app.get("/auth/tiktok/url", (req, res) => {
   res.json({ ok: true, authorize_url });
 });
 
-// Manual test-redirect (kan du bruge direkte i browser)
-// NOTE: Denne route er tænkt til normal browser-navigation (href), ikke fetch.
+// Manual test-redirect – brug i browser, ikke via fetch
 app.get("/auth/tiktok/connect", (req, res) => {
   if (!TT_CLIENT_KEY || !TT_REDIRECT) {
     return res
@@ -485,7 +611,6 @@ app.get("/auth/tiktok/callback", async (req, res) => {
     const display_name = user.display_name || "TikTok User";
     const avatar_url = user.avatar_url || null;
 
-    // Gem ALT i tiktok_accounts (én tabel)
     const { error: accError } = await supabase.from("tiktok_accounts").upsert(
       {
         open_id,
