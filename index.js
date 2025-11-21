@@ -751,6 +751,33 @@ app.get("/auth/tiktok/status", async (req, res) => {
   }
 });
 
+// Clear / disconnect TikTok account(s)
+app.post("/auth/tiktok/clear", async (req, res) => {
+  try {
+    // Slet alle rækker i tiktok_accounts – eller begræns via id hvis du vil
+    const { error } = await supabase.from("tiktok_accounts").delete().neq("id", 0);
+
+    if (error) {
+      console.error("Supabase tiktok_accounts clear error:", error);
+      return res.status(500).json({
+        ok: false,
+        error: "supabase_clear_error",
+        detail: error.message || String(error),
+      });
+    }
+
+    return res.json({ ok: true, cleared: true });
+  } catch (err) {
+    console.error("POST /auth/tiktok/clear error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "internal_error",
+      detail: String(err),
+    });
+  }
+});
+
+
 // Liste kontoer
 app.get("/tiktok/accounts", async (req, res) => {
   try {
