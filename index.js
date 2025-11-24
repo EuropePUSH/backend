@@ -35,9 +35,11 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   );
 }
 
-const supabase = SUPABASE_URL
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-  : null;
+// ✅ IMPORTANT: only create client if BOTH URL + KEY exist
+const supabase =
+  SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    : null;
 
 async function updateJobInDb(jobId, patch) {
   if (!supabase) {
@@ -79,7 +81,7 @@ async function getJobFromDb(jobId) {
   return data;
 }
 
-// generic Supabase upload helper (matches your logs)
+// generic Supabase upload helper
 async function uploadOutputToSupabase(jobId, buffer) {
   if (!supabase) {
     console.log('[JOB]', jobId, 'Supabase upload skipped (no supabase)');
@@ -112,9 +114,6 @@ async function uploadOutputToSupabase(jobId, buffer) {
 
 // ---- TikTok helpers -------------------------------------------------------
 
-// You should already be storing access_token + open_id per workspace/account.
-// This function is a thin wrapper around TikTok's Content Posting API
-// using PULL_FROM_URL (inbox upload).
 async function uploadVideoToTikTokInbox({
   jobId,
   account,
@@ -140,7 +139,6 @@ async function uploadVideoToTikTokInbox({
       video_url: videoUrl
     },
     post_info: {
-      // goes into the draft – user can change before publishing
       title: fullCaption || 'Europepush ContentMølle export'
     }
   };
@@ -157,7 +155,7 @@ async function uploadVideoToTikTokInbox({
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
-      'X-Tt-Account-Id': openId // in some docs this is optional; keep if you already use it
+      'X-Tt-Account-Id': openId
     },
     body: JSON.stringify(body)
   });
@@ -174,7 +172,6 @@ async function uploadVideoToTikTokInbox({
   }
 
   const data = await resp.json();
-  // The actual response structure can vary – adapt to your real response
   const publishId =
     data?.data?.publish_id ||
     data?.data?.publish_id_str ||
@@ -208,8 +205,6 @@ function buildCaption(caption, hashtags) {
   return (caption || '').trim() + tags;
 }
 
-// Lookup TikTok account for a given account_id / workspace.
-// Here we assume a table tiktok_accounts(workspace_id, account_id, access_token, open_id)
 async function getTikTokAccount(accountId, workspaceId) {
   if (!supabase) return null;
   const query = supabase
@@ -230,7 +225,6 @@ async function getTikTokAccount(accountId, workspaceId) {
   return data;
 }
 
-// Clear TikTok connection for a workspace (used by /auth/tiktok/clear)
 async function clearTikTokConnection(workspaceId) {
   if (!supabase) {
     console.log('[TikTok] clearTikTokConnection skipped (no supabase)');
@@ -298,9 +292,8 @@ app.get('/debug/version', (req, res) => {
   res.json({ version: BACKEND_VERSION });
 });
 
-// ---- TikTok auth routes (minimal set) ------------------------------------
+// ---- TikTok auth routes ---------------------------------------------------
 
-// Status: is TikTok connected?
 app.get('/auth/tiktok/status', async (req, res) => {
   const workspaceId = req.headers['x-workspace-id'];
   if (!workspaceId || !supabase) {
@@ -323,8 +316,6 @@ app.get('/auth/tiktok/status', async (req, res) => {
   });
 });
 
-// Connect: this endpoint should either redirect directly to TikTok OR return JSON with a URL.
-// Easiest: let frontend do window.location = '/auth/tiktok/connect'.
 app.get('/auth/tiktok/connect', (req, res) => {
   const workspaceId = req.headers['x-workspace-id'] || 'no_workspace';
   const clientKey = process.env.TIKTOK_CLIENT_KEY;
@@ -335,7 +326,7 @@ app.get('/auth/tiktok/connect', (req, res) => {
   const scopes = [
     'user.info.basic',
     'video.upload',
-    'video.publish' // adjust if TikTok changes
+    'video.publish'
   ];
 
   const state = `state_epush_${nanoid(8)}_${workspaceId}`;
@@ -347,7 +338,6 @@ app.get('/auth/tiktok/connect', (req, res) => {
   authUrl.searchParams.set('redirect_uri', redirectUri);
   authUrl.searchParams.set('state', state);
 
-  // Frontend can fetch this and redirect, or you can just redirect directly:
   if (req.headers['x-return-json'] === '1') {
     return res.json({ url: authUrl.toString(), state });
   }
@@ -355,8 +345,6 @@ app.get('/auth/tiktok/connect', (req, res) => {
   return res.redirect(authUrl.toString());
 });
 
-// Callback: exchange code for token and store it.
-// NOTE: This is a skeleton – you should adapt to your existing implementation.
 app.get('/auth/tiktok/callback', async (req, res) => {
   const { code, state } = req.query;
   const clientKey = process.env.TIKTOK_CLIENT_KEY;
@@ -369,10 +357,8 @@ app.get('/auth/tiktok/callback', async (req, res) => {
     return res.status(400).send('Missing code');
   }
 
-  // Extract workspaceId from state if you encoded it there
-  const workspaceId = typeof state === 'string'
-    ? state.split('_').slice(-1)[0]
-    : 'no_workspace';
+  const workspaceId =
+    typeof state === 'string' ? state.split('_').slice(-1)[0] : 'no_workspace';
 
   try {
     const tokenResp = await fetch(
@@ -419,10 +405,10 @@ app.get('/auth/tiktok/callback', async (req, res) => {
       );
     }
 
-    // Redirect back to your frontend
+    // ✅ NEW DEFAULT: send user back to /accounts instead of /integrations/tiktok
     const redirectBack =
       process.env.TIKTOK_CONNECT_DONE_REDIRECT ||
-      `${FRONTEND_ORIGIN}/integrations/tiktok?status=connected`;
+      `${FRONTEND_ORIGIN}/accounts?status=tiktok_connected`;
 
     res.redirect(redirectBack);
   } catch (err) {
@@ -431,7 +417,7 @@ app.get('/auth/tiktok/callback', async (req, res) => {
   }
 });
 
-// *** NEW *** – clear + disconnect TikTok connection (fixes your 404)
+// clear + disconnect TikTok
 app.post('/auth/tiktok/clear', async (req, res) => {
   try {
     const workspaceId = req.headers['x-workspace-id'];
@@ -449,7 +435,7 @@ app.post('/auth/tiktok/clear', async (req, res) => {
   }
 });
 
-// List connected TikTok accounts (what your frontend is already calling)
+// List connected TikTok accounts
 app.get('/tiktok/accounts', async (req, res) => {
   const workspaceId = req.headers['x-workspace-id'];
   if (!workspaceId || !supabase) {
@@ -469,7 +455,7 @@ app.get('/tiktok/accounts', async (req, res) => {
   res.json({ accounts: data || [] });
 });
 
-// ---- Jobs (ContentMølle → encode → Supabase → TikTok) --------------------
+// ---- Jobs (ContentMølle) --------------------------------------------------
 
 app.post('/jobs', async (req, res) => {
   const payload = req.body || {};
@@ -500,7 +486,6 @@ app.post('/jobs', async (req, res) => {
 
   await insertJobInDb(jobRecord);
 
-  // Fire-and-forget processing
   processJob(jobId, payload).catch((err) => {
     console.error('[JOB]', jobId, 'UNHANDLED processJob error:', err);
   });
@@ -517,17 +502,19 @@ app.get('/jobs/:id', async (req, res) => {
   res.json(job);
 });
 
-// ---- Job processing -------------------------------------------------------
-
 async function processJob(jobId, input) {
   console.log('[JOB]', jobId, 'processJob start, input:', input);
 
   await updateJobInDb(jobId, { state: 'processing', progress: 10 });
 
-  const { source_video_url, caption, hashtags, postToTikTok, tiktok_account_ids } =
-    input;
+  const {
+    source_video_url,
+    caption,
+    hashtags,
+    postToTikTok,
+    tiktok_account_ids
+  } = input;
 
-  // 1) Download source video to temp
   console.log('[JOB]', jobId, 'Downloading video from', source_video_url);
   const sourceResp = await fetch(source_video_url);
   if (!sourceResp.ok) {
@@ -555,7 +542,6 @@ async function processJob(jobId, input) {
 
   await fs.writeFile(inFile, sourceBuf);
 
-  // 2) FFmpeg transcode (matches the logs you've shown)
   const ffmpegArgs = [
     '-y',
     '-hide_banner',
@@ -594,23 +580,20 @@ async function processJob(jobId, input) {
 
   await updateJobInDb(jobId, { state: 'processing', progress: 40 });
 
-  // 3) Read encoded file
   const encodedBuf = await fs.readFile(outFile);
   console.log('[JOB]', jobId, 'Encoded file size:', encodedBuf.length);
 
   await updateJobInDb(jobId, { state: 'processing', progress: 60 });
 
-  // 4) Upload to Supabase
   const publicUrl = await uploadOutputToSupabase(jobId, encodedBuf);
 
   await updateJobInDb(jobId, { state: 'processing', progress: 70 });
 
-  // 5) TikTok upload (optional)
   const tiktokResults = [];
 
   if (postToTikTok && Array.isArray(tiktok_account_ids)) {
     for (const accountId of tiktok_account_ids) {
-      const workspaceId = null; // or derive from job/workspace context
+      const workspaceId = null; // TODO: derive from context if needed
       const account = await getTikTokAccount(accountId, workspaceId);
 
       try {
@@ -654,7 +637,6 @@ async function processJob(jobId, input) {
 
   await updateJobInDb(jobId, { state: 'processing', progress: 90 });
 
-  // 6) Finalize job
   const output = [
     {
       idx: 0,
@@ -680,7 +662,7 @@ function runFfmpeg(jobId, args) {
     const ff = spawn('ffmpeg', args);
 
     ff.stderr.on('data', (data) => {
-      process.stderr.write(data); // keep the detailed ffmpeg logs
+      process.stderr.write(data);
     });
 
     ff.on('error', (err) => {
