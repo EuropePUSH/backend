@@ -26,8 +26,8 @@ const BACKEND_VERSION =
 
 // ---- Supabase setup -------------------------------------------------------
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL || null;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || null;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.warn(
@@ -35,7 +35,6 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   );
 }
 
-// ✅ IMPORTANT: only create client if BOTH URL + KEY exist
 const supabase =
   SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
     ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -81,7 +80,7 @@ async function getJobFromDb(jobId) {
   return data;
 }
 
-// generic Supabase upload helper
+// generic Supabase upload helper (matches your logs)
 async function uploadOutputToSupabase(jobId, buffer) {
   if (!supabase) {
     console.log('[JOB]', jobId, 'Supabase upload skipped (no supabase)');
@@ -294,8 +293,9 @@ app.get('/debug/version', (req, res) => {
 
 // ---- TikTok auth routes ---------------------------------------------------
 
+// Status: is TikTok connected?
 app.get('/auth/tiktok/status', async (req, res) => {
-  const workspaceId = req.headers['x-workspace-id'];
+  const workspaceId = req.headers['x-workspace-id'] || req.query.workspaceId;
   if (!workspaceId || !supabase) {
     return res.json({ connected: false, accounts: [] });
   }
@@ -316,8 +316,13 @@ app.get('/auth/tiktok/status', async (req, res) => {
   });
 });
 
+// Connect: redirect to TikTok OAuth (MÅ IKKE være via fetch i browseren)
 app.get('/auth/tiktok/connect', (req, res) => {
-  const workspaceId = req.headers['x-workspace-id'] || 'no_workspace';
+  const workspaceId =
+    req.headers['x-workspace-id'] ||
+    req.query.workspaceId ||
+    'no_workspace';
+
   const clientKey = process.env.TIKTOK_CLIENT_KEY;
   const redirectUri =
     process.env.TIKTOK_REDIRECT_URI ||
@@ -345,6 +350,7 @@ app.get('/auth/tiktok/connect', (req, res) => {
   return res.redirect(authUrl.toString());
 });
 
+// Callback: exchange code for token and store it.
 app.get('/auth/tiktok/callback', async (req, res) => {
   const { code, state } = req.query;
   const clientKey = process.env.TIKTOK_CLIENT_KEY;
@@ -405,7 +411,6 @@ app.get('/auth/tiktok/callback', async (req, res) => {
       );
     }
 
-    // ✅ NEW DEFAULT: send user back to /accounts instead of /integrations/tiktok
     const redirectBack =
       process.env.TIKTOK_CONNECT_DONE_REDIRECT ||
       `${FRONTEND_ORIGIN}/accounts?status=tiktok_connected`;
@@ -417,10 +422,11 @@ app.get('/auth/tiktok/callback', async (req, res) => {
   }
 });
 
-// clear + disconnect TikTok
+// Clear + disconnect TikTok connection
 app.post('/auth/tiktok/clear', async (req, res) => {
   try {
-    const workspaceId = req.headers['x-workspace-id'];
+    const workspaceId =
+      req.headers['x-workspace-id'] || req.query.workspaceId || null;
     if (!workspaceId) {
       return res
         .status(400)
@@ -437,7 +443,8 @@ app.post('/auth/tiktok/clear', async (req, res) => {
 
 // List connected TikTok accounts
 app.get('/tiktok/accounts', async (req, res) => {
-  const workspaceId = req.headers['x-workspace-id'];
+  const workspaceId =
+    req.headers['x-workspace-id'] || req.query.workspaceId || null;
   if (!workspaceId || !supabase) {
     return res.json({ accounts: [] });
   }
@@ -455,7 +462,7 @@ app.get('/tiktok/accounts', async (req, res) => {
   res.json({ accounts: data || [] });
 });
 
-// ---- Jobs (ContentMølle) --------------------------------------------------
+// ---- Jobs (ContentMølle → encode → Supabase → TikTok) --------------------
 
 app.post('/jobs', async (req, res) => {
   const payload = req.body || {};
@@ -501,6 +508,8 @@ app.get('/jobs/:id', async (req, res) => {
   }
   res.json(job);
 });
+
+// ---- Job processing -------------------------------------------------------
 
 async function processJob(jobId, input) {
   console.log('[JOB]', jobId, 'processJob start, input:', input);
@@ -593,7 +602,7 @@ async function processJob(jobId, input) {
 
   if (postToTikTok && Array.isArray(tiktok_account_ids)) {
     for (const accountId of tiktok_account_ids) {
-      const workspaceId = null; // TODO: derive from context if needed
+      const workspaceId = null; // TODO: koble workspace på jobs når du har det
       const account = await getTikTokAccount(accountId, workspaceId);
 
       try {
