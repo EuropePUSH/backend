@@ -1,5 +1,5 @@
 // index.js
-// Europepush backend – ContentMølle + TikTok uploader (simple, no workspace filter)
+// Europepush backend – ContentMølle + TikTok uploader
 
 import express from 'express';
 import fetch from 'node-fetch';
@@ -22,7 +22,7 @@ const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'https://europepush.com';
 
 // Version (for /debug/version)
 const BACKEND_VERSION =
-  process.env.BACKEND_VERSION || '2025-11-25-tiktok-workspace-free';
+  process.env.BACKEND_VERSION || '2025-11-25-tiktok-username-patch';
 
 // ---- Supabase setup -------------------------------------------------------
 
@@ -79,7 +79,7 @@ async function getJobFromDb(jobId) {
   return data;
 }
 
-// generic Supabase upload helper
+// generic Supabase upload helper (matches your logs)
 async function uploadOutputToSupabase(jobId, buffer) {
   if (!supabase) {
     console.log('[JOB]', jobId, 'Supabase upload skipped (no supabase)');
@@ -112,7 +112,7 @@ async function uploadOutputToSupabase(jobId, buffer) {
 
 // ---- TikTok helpers -------------------------------------------------------
 
-// Build caption + hashtags
+// Build final caption from text + hashtags
 function buildCaption(caption, hashtags) {
   const tags =
     Array.isArray(hashtags) && hashtags.length
@@ -126,7 +126,7 @@ function buildCaption(caption, hashtags) {
   return (caption || '').trim() + tags;
 }
 
-// Upload video to TikTok inbox (PULL_FROM_URL)
+// PULL_FROM_URL upload to TikTok Inbox (drafts)
 async function uploadVideoToTikTokInbox({
   jobId,
   account,
@@ -205,16 +205,20 @@ async function uploadVideoToTikTokInbox({
   };
 }
 
-// Lookup TikTok account by account_id (no workspace filter)
-async function getTikTokAccount(accountId) {
+// Lookup TikTok account from DB
+async function getTikTokAccount(accountId, workspaceId) {
   if (!supabase) return null;
-  const { data, error } = await supabase
+  const query = supabase
     .from('tiktok_accounts')
     .select('*')
     .eq('account_id', accountId)
-    .limit(1)
-    .maybeSingle();
+    .limit(1);
 
+  if (workspaceId) {
+    query.eq('workspace_id', workspaceId);
+  }
+
+  const { data, error } = await query.single();
   if (error) {
     console.error('[TikTok] getTikTokAccount error:', error);
     return null;
@@ -222,28 +226,23 @@ async function getTikTokAccount(accountId) {
   return data;
 }
 
-// Clear all TikTok connections (or per workspace later if du vil)
+// Clear TikTok tokens for a workspace
 async function clearTikTokConnection(workspaceId) {
   if (!supabase) {
     console.log('[TikTok] clearTikTokConnection skipped (no supabase)');
     return;
   }
-
-  let query = supabase.from('tiktok_accounts').delete();
-
-  // hvis du på et tidspunkt vil bruge workspace_id igen:
-  if (workspaceId) {
-    query = query.eq('workspace_id', workspaceId);
-  }
-
-  const { error } = await query;
+  const { error } = await supabase
+    .from('tiktok_accounts')
+    .delete()
+    .eq('workspace_id', workspaceId);
 
   if (error) {
     console.error('[TikTok] clearTikTokConnection error:', error);
   } else {
     console.log(
-      '[TikTok] Cleared TikTok tokens/accounts',
-      workspaceId ? `for workspace ${workspaceId}` : '(all)'
+      '[TikTok] Cleared TikTok tokens/accounts for workspace',
+      workspaceId
     );
   }
 }
@@ -299,14 +298,15 @@ app.get('/debug/version', (req, res) => {
 
 // Status: is TikTok connected?
 app.get('/auth/tiktok/status', async (req, res) => {
-  if (!supabase) {
+  const workspaceId = req.headers['x-workspace-id'];
+  if (!workspaceId || !supabase) {
     return res.json({ connected: false, accounts: [] });
   }
 
   const { data, error } = await supabase
     .from('tiktok_accounts')
     .select('account_id, open_id, username')
-    .order('created_at', { ascending: false });
+    .eq('workspace_id', workspaceId);
 
   if (error) {
     console.error('[TikTok] status error:', error);
@@ -314,14 +314,14 @@ app.get('/auth/tiktok/status', async (req, res) => {
   }
 
   res.json({
-    connected: (data || []).length > 0,
+    connected: (data && data.length > 0) || false,
     accounts: data || []
   });
 });
 
-// Connect: return TikTok auth URL as JSON
+// Connect: return TikTok auth URL (for frontend to open)
 app.get('/auth/tiktok/connect', (req, res) => {
-  // vi ignorerer workspace her – appen er single-tenant lige nu
+  const workspaceId = req.headers['x-workspace-id'] || 'no_workspace';
   const clientKey = process.env.TIKTOK_CLIENT_KEY;
   const redirectUri =
     process.env.TIKTOK_REDIRECT_URI ||
@@ -333,7 +333,7 @@ app.get('/auth/tiktok/connect', (req, res) => {
     'video.publish'
   ];
 
-  const state = `state_epush_${nanoid(8)}_default`;
+  const state = `state_epush_${nanoid(8)}_${workspaceId}`;
 
   const authUrl = new URL('https://www.tiktok.com/v2/auth/authorize/');
   authUrl.searchParams.set('client_key', clientKey);
@@ -342,16 +342,20 @@ app.get('/auth/tiktok/connect', (req, res) => {
   authUrl.searchParams.set('redirect_uri', redirectUri);
   authUrl.searchParams.set('state', state);
 
-  const wantsJson = req.headers['x-return-json'] === '1';
-
-  if (wantsJson) {
-    return res.json({ ok: true, url: authUrl.toString(), state, workspaceId: 'default' });
+  // If frontend asks for JSON (X-Return-Json: 1), send URL instead of redirect
+  if (req.headers['x-return-json'] === '1') {
+    return res.json({
+      ok: true,
+      url: authUrl.toString(),
+      state,
+      workspaceId
+    });
   }
 
   return res.redirect(authUrl.toString());
 });
 
-// Callback: exchange code for token and store it in Supabase
+// Callback: exchange code for token, fetch username, store in Supabase
 app.get('/auth/tiktok/callback', async (req, res) => {
   const { code, state } = req.query;
   const clientKey = process.env.TIKTOK_CLIENT_KEY;
@@ -364,14 +368,14 @@ app.get('/auth/tiktok/callback', async (req, res) => {
     return res.status(400).send('Missing code');
   }
 
-  // vi kan stadig parse workspace ud af state, men vi bruger "default" hvis ikke
-  let workspaceId = 'default';
-  if (typeof state === 'string') {
-    const parts = state.split('_');
-    workspaceId = parts[parts.length - 1] || 'default';
-  }
+  // workspaceId = sidste del af state string
+  const workspaceId =
+    typeof state === 'string'
+      ? state.split('_').slice(-1)[0]
+      : 'no_workspace';
 
   try {
+    // 1) Exchange code for access token
     const tokenResp = await fetch(
       'https://open.tiktokapis.com/v2/oauth/token/',
       {
@@ -398,37 +402,71 @@ app.get('/auth/tiktok/callback', async (req, res) => {
     const accessToken = tokenData.access_token;
     const openId = tokenData.open_id;
     const expiresIn = tokenData.expires_in;
-    const refreshToken = tokenData.refresh_token || null;
 
-    console.log('[TikTok] callback tokenData:', {
-      open_id: openId,
-      expires_in: expiresIn,
-      scope: tokenData.scope
-    });
+    // 2) Fetch user info to get username (display_name)
+    let username = null;
+    try {
+      const userResp = await fetch(
+        'https://open.tiktokapis.com/v2/user/info/',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${accessToken}`
+          },
+          body: JSON.stringify({
+            fields: ['display_name']
+          })
+        }
+      );
 
+      if (userResp.ok) {
+        const userData = await userResp.json();
+        username =
+          userData?.data?.user?.display_name ||
+          userData?.data?.user?.username ||
+          null;
+      } else {
+        const errUser = await userResp.json().catch(() => ({}));
+        console.warn('[TikTok] user.info error:', errUser);
+      }
+    } catch (e) {
+      console.warn('[TikTok] Failed to fetch username:', e);
+    }
+
+    // 3) Store / upsert TikTok account in Supabase
     if (supabase) {
-      const row = {
-        workspace_id: workspaceId,
-        account_id: openId,
-        open_id: openId,
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        expires_at: new Date(Date.now() + expiresIn * 1000).toISOString()
-      };
-
-      const { error } = await supabase
-        .from('tiktok_accounts')
-        .upsert(row, {
+      const { error } = await supabase.from('tiktok_accounts').upsert(
+        {
+          workspace_id: workspaceId,
+          account_id: openId,
+          open_id: openId,
+          access_token: accessToken,
+          expires_at: new Date(
+            Date.now() + expiresIn * 1000
+          ).toISOString(),
+          username: username
+        },
+        {
           onConflict: 'workspace_id,account_id'
-        });
+        }
+      );
 
       if (error) {
-        console.error('[TikTok] upsert error:', error);
+        console.error('[TikTok] upsert tiktok_accounts error:', error);
       } else {
-        console.log('[TikTok] upsert OK for open_id', openId);
+        console.log(
+          '[TikTok] Stored account for workspace',
+          workspaceId,
+          'open_id',
+          openId,
+          'username',
+          username
+        );
       }
     }
 
+    // 4) Redirect back to frontend
     const redirectBack =
       process.env.TIKTOK_CONNECT_DONE_REDIRECT ||
       `${FRONTEND_ORIGIN}/tiktok-connect?status=connected`;
@@ -440,10 +478,16 @@ app.get('/auth/tiktok/callback', async (req, res) => {
   }
 });
 
-// Disconnect TikTok (clears tiktok_accounts)
+// Clear TikTok connection for workspace
 app.post('/auth/tiktok/clear', async (req, res) => {
   try {
-    const workspaceId = req.headers['x-workspace-id'] || null;
+    const workspaceId = req.headers['x-workspace-id'];
+    if (!workspaceId) {
+      return res
+        .status(400)
+        .json({ ok: false, error: 'missing_workspace_id' });
+    }
+
     await clearTikTokConnection(workspaceId);
     return res.json({ ok: true });
   } catch (err) {
@@ -452,16 +496,17 @@ app.post('/auth/tiktok/clear', async (req, res) => {
   }
 });
 
-// List connected TikTok accounts (no workspace filter for now)
+// List connected TikTok accounts
 app.get('/tiktok/accounts', async (req, res) => {
-  if (!supabase) {
+  const workspaceId = req.headers['x-workspace-id'];
+  if (!workspaceId || !supabase) {
     return res.json({ accounts: [] });
   }
 
   const { data, error } = await supabase
     .from('tiktok_accounts')
     .select('account_id, open_id, username')
-    .order('created_at', { ascending: false });
+    .eq('workspace_id', workspaceId);
 
   if (error) {
     console.error('[TikTok] accounts error:', error);
@@ -534,7 +579,7 @@ async function processJob(jobId, input) {
     tiktok_account_ids
   } = input;
 
-  // 1) Download source video to temp
+  // 1) Download source video
   console.log('[JOB]', jobId, 'Downloading video from', source_video_url);
   const sourceResp = await fetch(source_video_url);
   if (!sourceResp.ok) {
@@ -617,7 +662,9 @@ async function processJob(jobId, input) {
 
   if (postToTikTok && Array.isArray(tiktok_account_ids)) {
     for (const accountId of tiktok_account_ids) {
-      const account = await getTikTokAccount(accountId);
+      // If you later want per-workspace posting, pass workspaceId here
+      const workspaceId = null;
+      const account = await getTikTokAccount(accountId, workspaceId);
 
       try {
         if (!account) {
