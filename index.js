@@ -22,7 +22,7 @@ const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'https://europepush.com';
 
 // Version (for /debug/version)
 const BACKEND_VERSION =
-  process.env.BACKEND_VERSION || '2025-11-25-tiktok-oauth-workspace-fix';
+  process.env.BACKEND_VERSION || '2025-11-25-tiktok-workspace-fix-v1';
 
 // ---- Supabase setup -------------------------------------------------------
 
@@ -77,7 +77,6 @@ async function getJobFromDb(jobId) {
   return data;
 }
 
-// generic Supabase upload helper
 async function uploadOutputToSupabase(jobId, buffer) {
   if (!supabase) {
     console.log('[JOB]', jobId, 'Supabase upload skipped (no supabase)');
@@ -110,82 +109,6 @@ async function uploadOutputToSupabase(jobId, buffer) {
 
 // ---- TikTok helpers -------------------------------------------------------
 
-// Build full caption incl. hashtags
-function buildCaption(caption, hashtags) {
-  const tags =
-    Array.isArray(hashtags) && hashtags.length
-      ? ' ' +
-        hashtags
-          .map((t) => t.trim())
-          .filter(Boolean)
-          .map((t) => (t.startsWith('#') ? t : `#${t}`))
-          .join(' ')
-      : '';
-  return (caption || '').trim() + tags;
-}
-
-// Parse workspaceId from the OAuth state param.
-// We encode it as: state_epush_<random>_<encodeURIComponent(workspaceId)>
-function parseWorkspaceIdFromState(state) {
-  if (typeof state !== 'string') return 'no_workspace';
-  const parts = state.split('_');
-  if (parts.length < 4) return 'no_workspace';
-  const encodedWs = parts.slice(3).join('_');
-  try {
-    return decodeURIComponent(encodedWs) || 'no_workspace';
-  } catch (_) {
-    return 'no_workspace';
-  }
-}
-
-// Lookup TikTok account for a given account_id / workspace.
-async function getTikTokAccount(accountId, workspaceId) {
-  if (!supabase) return null;
-  const query = supabase
-    .from('tiktok_accounts')
-    .select('*')
-    .eq('account_id', accountId)
-    .limit(1);
-
-  if (workspaceId) {
-    query.eq('workspace_id', workspaceId);
-  }
-
-  const { data, error } = await query.single();
-  if (error) {
-    console.error(
-      '[TikTok] getTikTokAccount error:',
-      error,
-      'workspaceId=',
-      workspaceId
-    );
-    return null;
-  }
-  return data;
-}
-
-// Clear TikTok connection for a workspace
-async function clearTikTokConnection(workspaceId) {
-  if (!supabase) {
-    console.log('[TikTok] clearTikTokConnection skipped (no supabase)');
-    return;
-  }
-  const { error } = await supabase
-    .from('tiktok_accounts')
-    .delete()
-    .eq('workspace_id', workspaceId);
-
-  if (error) {
-    console.error('[TikTok] clearTikTokConnection error:', error);
-  } else {
-    console.log(
-      '[TikTok] Cleared TikTok tokens/accounts for workspace',
-      workspaceId
-    );
-  }
-}
-
-// Upload video to TikTok inbox using PULL_FROM_URL
 async function uploadVideoToTikTokInbox({
   jobId,
   account,
@@ -264,6 +187,69 @@ async function uploadVideoToTikTokInbox({
   };
 }
 
+function buildCaption(caption, hashtags) {
+  const tags =
+    Array.isArray(hashtags) && hashtags.length
+      ? ' ' +
+        hashtags
+          .map((t) => t.trim())
+          .filter(Boolean)
+          .map((t) => (t.startsWith('#') ? t : `#${t}`))
+          .join(' ')
+      : '';
+  return (caption || '').trim() + tags;
+}
+
+// Generic helper: get workspaceId from header or query, fallback no_workspace
+function getWorkspaceId(req) {
+  return (
+    req.headers['x-workspace-id'] ||
+    req.query.workspaceId ||
+    'no_workspace'
+  );
+}
+
+// Lookup TikTok account
+async function getTikTokAccount(accountId, workspaceId) {
+  if (!supabase) return null;
+  let query = supabase
+    .from('tiktok_accounts')
+    .select('*')
+    .eq('account_id', accountId)
+    .limit(1);
+
+  if (workspaceId) {
+    query = query.eq('workspace_id', workspaceId);
+  }
+
+  const { data, error } = await query.single();
+  if (error) {
+    console.error('[TikTok] getTikTokAccount error:', error);
+    return null;
+  }
+  return data;
+}
+
+async function clearTikTokConnection(workspaceId) {
+  if (!supabase) {
+    console.log('[TikTok] clearTikTokConnection skipped (no supabase)');
+    return;
+  }
+  const { error } = await supabase
+    .from('tiktok_accounts')
+    .delete()
+    .eq('workspace_id', workspaceId);
+
+  if (error) {
+    console.error('[TikTok] clearTikTokConnection error:', error);
+  } else {
+    console.log(
+      '[TikTok] Cleared TikTok tokens/accounts for workspace',
+      workspaceId
+    );
+  }
+}
+
 // ---- CORS + logging middleware -------------------------------------------
 
 app.use((req, res, next) => {
@@ -282,7 +268,7 @@ app.use((req, res, next) => {
 
   res.header(
     'Access-Control-Allow-Headers',
-    'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Workspace-Id, X-Return-Json'
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Workspace-Id'
   );
   res.header(
     'Access-Control-Allow-Methods',
@@ -315,32 +301,46 @@ app.get('/debug/version', (req, res) => {
 
 // Status: is TikTok connected?
 app.get('/auth/tiktok/status', async (req, res) => {
-  const workspaceId = req.headers['x-workspace-id'];
-  console.log('[TikTok] /auth/tiktok/status workspaceId =', workspaceId);
+  const workspaceId = getWorkspaceId(req);
 
   if (!workspaceId || !supabase) {
-    return res.json({ connected: false, accounts: [] });
+    return res.json({ connected: false, accounts: [], workspaceId });
   }
 
-  const { data, error } = await supabase
+  // first try the current workspace
+  let { data, error } = await supabase
     .from('tiktok_accounts')
-    .select('account_id, open_id, username')
+    .select('account_id, open_id, username, workspace_id')
     .eq('workspace_id', workspaceId);
 
   if (error) {
     console.error('[TikTok] status error:', error);
-    return res.status(500).json({ connected: false, accounts: [] });
+    return res.status(500).json({ connected: false, accounts: [], workspaceId });
+  }
+
+  // WORKSPACE FALLBACK:
+  // If nothing found for this workspace, fall back to "no_workspace"
+  if ((!data || data.length === 0) && workspaceId !== 'no_workspace') {
+    const fallback = await supabase
+      .from('tiktok_accounts')
+      .select('account_id, open_id, username, workspace_id')
+      .eq('workspace_id', 'no_workspace');
+
+    if (!fallback.error && fallback.data?.length) {
+      data = fallback.data;
+    }
   }
 
   res.json({
-    connected: data.length > 0,
-    accounts: data
+    connected: data && data.length > 0,
+    accounts: data || [],
+    workspaceId
   });
 });
 
-// Connect: returns TikTok OAuth URL (frontend redirects)
+// Connect: redirect to TikTok OAuth
 app.get('/auth/tiktok/connect', (req, res) => {
-  const workspaceId = req.headers['x-workspace-id'] || 'no_workspace';
+  const workspaceId = getWorkspaceId(req);
   const clientKey = process.env.TIKTOK_CLIENT_KEY;
   const redirectUri =
     process.env.TIKTOK_REDIRECT_URI ||
@@ -349,11 +349,10 @@ app.get('/auth/tiktok/connect', (req, res) => {
   const scopes = [
     'user.info.basic',
     'video.upload',
-    'video.publish' // adjust if TikTok changes
+    'video.publish'
   ];
 
-  const encodedWorkspace = encodeURIComponent(workspaceId);
-  const state = `state_epush_${nanoid(8)}_${encodedWorkspace}`;
+  const state = `state_epush_${nanoid(8)}_${workspaceId}`;
 
   const authUrl = new URL('https://www.tiktok.com/v2/auth/authorize/');
   authUrl.searchParams.set('client_key', clientKey);
@@ -362,28 +361,15 @@ app.get('/auth/tiktok/connect', (req, res) => {
   authUrl.searchParams.set('redirect_uri', redirectUri);
   authUrl.searchParams.set('state', state);
 
-  // Debug log so you can see workspace vs state
-  console.log(
-    '[TikTok] /auth/tiktok/connect workspaceId=',
-    workspaceId,
-    'state=',
-    state
-  );
-
-  // Frontend can either redirect or read JSON
-  if (req.headers['x-return-json'] === '1') {
-    return res.json({
-      ok: true,
-      url: authUrl.toString(),
-      state,
-      workspaceId
-    });
+  // If frontend asks for JSON (debug), return URL instead of redirect
+  if (req.headers['x-return-json'] === '1' || req.query.returnJson === '1') {
+    return res.json({ ok: true, url: authUrl.toString(), state, workspaceId });
   }
 
   return res.redirect(authUrl.toString());
 });
 
-// Callback: exchange code for token and store it.
+// Callback: exchange code for token and store it
 app.get('/auth/tiktok/callback', async (req, res) => {
   const { code, state } = req.query;
   const clientKey = process.env.TIKTOK_CLIENT_KEY;
@@ -396,8 +382,10 @@ app.get('/auth/tiktok/callback', async (req, res) => {
     return res.status(400).send('Missing code');
   }
 
-  const workspaceId = parseWorkspaceIdFromState(state);
-  console.log('[TikTok] callback state=', state, 'workspaceId=', workspaceId);
+  const workspaceId =
+    typeof state === 'string'
+      ? state.split('_').slice(-1)[0] || 'no_workspace'
+      : 'no_workspace';
 
   try {
     const tokenResp = await fetch(
@@ -455,10 +443,10 @@ app.get('/auth/tiktok/callback', async (req, res) => {
   }
 });
 
-// Clear + disconnect TikTok connection
+// Clear TikTok connection
 app.post('/auth/tiktok/clear', async (req, res) => {
   try {
-    const workspaceId = req.headers['x-workspace-id'];
+    const workspaceId = getWorkspaceId(req);
     if (!workspaceId) {
       return res
         .status(400)
@@ -475,24 +463,36 @@ app.post('/auth/tiktok/clear', async (req, res) => {
 
 // List connected TikTok accounts
 app.get('/tiktok/accounts', async (req, res) => {
-  const workspaceId = req.headers['x-workspace-id'];
-  console.log('[TikTok] /tiktok/accounts workspaceId =', workspaceId);
+  const workspaceId = getWorkspaceId(req);
 
-  if (!workspaceId || !supabase) {
-    return res.json({ accounts: [] });
+  if (!supabase) {
+    return res.json({ accounts: [], workspaceId });
   }
 
-  const { data, error } = await supabase
+  // first try current workspace
+  let { data, error } = await supabase
     .from('tiktok_accounts')
-    .select('account_id, open_id, username')
+    .select('account_id, open_id, username, workspace_id')
     .eq('workspace_id', workspaceId);
 
   if (error) {
     console.error('[TikTok] accounts error:', error);
-    return res.status(500).json({ accounts: [] });
+    return res.status(500).json({ accounts: [], workspaceId });
   }
 
-  res.json({ accounts: data || [] });
+  // WORKSPACE FALLBACK: if nothing for this workspace, fall back to "no_workspace"
+  if ((!data || data.length === 0) && workspaceId !== 'no_workspace') {
+    const fallback = await supabase
+      .from('tiktok_accounts')
+      .select('account_id, open_id, username, workspace_id')
+      .eq('workspace_id', 'no_workspace');
+
+    if (!fallback.error && fallback.data?.length) {
+      data = fallback.data;
+    }
+  }
+
+  res.json({ accounts: data || [], workspaceId });
 });
 
 // ---- Jobs (ContentMølle → encode → Supabase → TikTok) --------------------
@@ -526,7 +526,6 @@ app.post('/jobs', async (req, res) => {
 
   await insertJobInDb(jobRecord);
 
-  // Fire-and-forget processing
   processJob(jobId, payload).catch((err) => {
     console.error('[JOB]', jobId, 'UNHANDLED processJob error:', err);
   });
@@ -558,7 +557,6 @@ async function processJob(jobId, input) {
     tiktok_account_ids
   } = input;
 
-  // 1) Download source video
   console.log('[JOB]', jobId, 'Downloading video from', source_video_url);
   const sourceResp = await fetch(source_video_url);
   if (!sourceResp.ok) {
@@ -586,7 +584,6 @@ async function processJob(jobId, input) {
 
   await fs.writeFile(inFile, sourceBuf);
 
-  // 2) FFmpeg transcode
   const ffmpegArgs = [
     '-y',
     '-hide_banner',
@@ -625,24 +622,21 @@ async function processJob(jobId, input) {
 
   await updateJobInDb(jobId, { state: 'processing', progress: 40 });
 
-  // 3) Read encoded file
   const encodedBuf = await fs.readFile(outFile);
   console.log('[JOB]', jobId, 'Encoded file size:', encodedBuf.length);
 
   await updateJobInDb(jobId, { state: 'processing', progress: 60 });
 
-  // 4) Upload to Supabase
   const publicUrl = await uploadOutputToSupabase(jobId, encodedBuf);
 
   await updateJobInDb(jobId, { state: 'processing', progress: 70 });
 
-  // 5) TikTok upload (optional)
   const tiktokResults = [];
 
   if (postToTikTok && Array.isArray(tiktok_account_ids)) {
     for (const accountId of tiktok_account_ids) {
-      const workspaceId = null; // can be wired in later if needed
-      const account = await getTikTokAccount(accountId, workspaceId);
+      // for now we ignore workspace here – account_id is unique
+      const account = await getTikTokAccount(accountId, null);
 
       try {
         if (!account) {
@@ -685,7 +679,6 @@ async function processJob(jobId, input) {
 
   await updateJobInDb(jobId, { state: 'processing', progress: 90 });
 
-  // 6) Finalize job
   const output = [
     {
       idx: 0,
